@@ -1,4 +1,4 @@
-import { MAP_WIDTH, MAP_HEIGHT, TILE_SIZE, VISION_RADIUS, COMBO_WINDOW, ELEMENT_COLORS, ELEMENT_NAMES, MODIFIER_NAMES, STATUS_COLORS, STATUS_TICK_INTERVAL } from './constants';
+import { MAP_WIDTH, MAP_HEIGHT, TILE_SIZE, VISION_RADIUS, COMBO_WINDOW, MUTATION_SLOTS, ELEMENT_COLORS, ELEMENT_NAMES, MODIFIER_NAMES, STATUS_COLORS, STATUS_TICK_INTERVAL } from './constants';
 import { TileType, StatusType, BuffType } from './types';
 import type { GameMap, TaggedRoom, ActiveBuff, Point, StatusEffect } from './types';
 import { generateDungeon } from './dungeon';
@@ -755,8 +755,12 @@ export class Game {
       }
     }
 
-    if (wasKeyPressed('Tab')) {
-      this.selectedSlot = (this.selectedSlot + 1) % 4;
+    // 1-4: select slot + fire ability
+    for (let i = 0; i < MUTATION_SLOTS; i++) {
+      if (wasKeyPressed(`Digit${i + 1}`)) {
+        this.selectedSlot = i;
+        this.player.useAbility(i);
+      }
     }
 
     // Tick mineral drop timers
@@ -1166,51 +1170,60 @@ export class Game {
         saveProgress(this.progress);
       }
 
-      this.ctx.fillStyle = 'rgba(0,0,0,0.8)';
+      this.ctx.fillStyle = 'rgba(0,0,0,0.85)';
       this.ctx.fillRect(0, 0, this.canvasW, this.canvasH);
+      const cx = this.canvasW / 2;
+
+      // Title
       this.ctx.fillStyle = '#e53170';
       this.ctx.font = 'bold 28px monospace';
       this.ctx.textAlign = 'center';
-      const cx = this.canvasW / 2;
-      let cy = this.canvasH / 2 - 80;
-      this.ctx.fillText('DISSOLVED', cx, cy);
+      this.ctx.fillText('DISSOLVED', cx, 60);
 
       // Run stats
       this.ctx.font = '11px monospace';
-      cy += 25;
       this.ctx.fillStyle = '#aaa';
-      this.ctx.fillText(`Floor ${this.floor} | Kills: ${this.runKills} | Bosses: ${this.runBossKills}`, cx, cy);
+      this.ctx.fillText(`Floor ${this.floor} | Kills: ${this.runKills} | Bosses: ${this.runBossKills}`, cx, 85);
 
-      cy += 18;
-      this.ctx.fillStyle = '#e0a030';
       const evoCount = this.player.discoveredEvolutions.size - (this.progress.discoveredEvolutions?.length || 0);
       const reward = calculateRunReward(this.floor, this.runKills, this.runBossKills, Math.max(0, evoCount));
-      this.ctx.fillText(`+${reward} Substrate Points (Total: ${this.progress.substratePoints})`, cx, cy);
+      this.ctx.fillStyle = '#e0a030';
+      this.ctx.fillText(`+${reward} Substrate Points (Total: ${this.progress.substratePoints})`, cx, 103);
 
-      cy += 18;
       this.ctx.fillStyle = '#888';
-      this.ctx.fillText(`Best: Floor ${this.progress.bestFloor} | Runs: ${this.progress.totalRuns}`, cx, cy);
+      this.ctx.fillText(`Best: Floor ${this.progress.bestFloor} | Runs: ${this.progress.totalRuns}`, cx, 121);
 
-      // Evolutions discovered
-      cy += 22;
+      // Divider line
+      this.ctx.strokeStyle = '#333';
+      this.ctx.beginPath();
+      this.ctx.moveTo(cx - 200, 135);
+      this.ctx.lineTo(cx + 200, 135);
+      this.ctx.stroke();
+
+      // Two-column layout: Evolutions (left) | Upgrades (right)
+      const colLeft = cx - 160;
+      const colRight = cx + 60;
+      const colTop = 155;
+
+      // Left column: Evolutions
+      this.ctx.textAlign = 'start';
       this.ctx.fillStyle = '#ffcc00';
       this.ctx.font = 'bold 10px monospace';
-      this.ctx.fillText('EVOLUTIONS', cx, cy);
-      cy += 14;
+      this.ctx.fillText('EVOLUTIONS', colLeft, colTop);
+      let ey = colTop + 16;
       this.ctx.font = '9px monospace';
       for (const recipe of EVOLUTION_RECIPES) {
         const discovered = this.player.discoveredEvolutions.has(recipe.id);
         this.ctx.fillStyle = discovered ? recipe.color : '#333';
-        this.ctx.fillText(discovered ? recipe.name : '???', cx, cy);
-        cy += 11;
+        this.ctx.fillText(discovered ? `● ${recipe.name}` : '● ???', colLeft, ey);
+        ey += 13;
       }
 
-      // Upgrades
-      cy += 16;
+      // Right column: Upgrades
       this.ctx.fillStyle = '#44ccff';
       this.ctx.font = 'bold 10px monospace';
-      this.ctx.fillText('UPGRADES (press 1-5 to buy)', cx, cy);
-      cy += 13;
+      this.ctx.fillText('UPGRADES [1-5]', colRight, colTop);
+      let uy = colTop + 16;
       this.ctx.font = '9px monospace';
       for (let i = 0; i < UPGRADES.length; i++) {
         const upg = UPGRADES[i];
@@ -1218,20 +1231,21 @@ export class Game {
         const maxed = level >= upg.maxLevel;
         const canAfford = !maxed && this.progress.substratePoints >= upg.costPerLevel;
         this.ctx.fillStyle = maxed ? '#666' : canAfford ? '#44ccff' : '#555';
-        const lvlStr = maxed ? 'MAX' : `Lv${level} → Lv${level + 1} (${upg.costPerLevel}pts)`;
-        this.ctx.fillText(`${i + 1}. ${upg.name}: ${lvlStr}`, cx, cy);
+        const lvlStr = maxed ? 'MAX' : `Lv${level}→${level + 1} (${upg.costPerLevel}pts)`;
+        this.ctx.fillText(`${i + 1}. ${upg.name}: ${lvlStr}`, colRight, uy);
         if (level > 0) {
-          cy += 10;
+          uy += 11;
           this.ctx.fillStyle = '#888';
-          this.ctx.fillText(upg.description(level), cx, cy);
+          this.ctx.fillText(`  ${upg.description(level)}`, colRight, uy);
         }
-        cy += 12;
+        uy += 14;
       }
 
-      cy += 8;
+      // Restart prompt at bottom
+      this.ctx.textAlign = 'center';
       this.ctx.fillStyle = '#ccccdd';
-      this.ctx.font = '12px monospace';
-      this.ctx.fillText('Press R to restart', cx, cy);
+      this.ctx.font = 'bold 12px monospace';
+      this.ctx.fillText('Press R to restart', cx, Math.max(ey, uy) + 20);
       this.ctx.textAlign = 'start';
     }
   }

@@ -136,12 +136,7 @@ export class Player {
       }
     }
 
-    // Ability activation (1-4 keys)
-    for (let i = 0; i < MUTATION_SLOTS; i++) {
-      if (isKeyDown(`Digit${i + 1}`) && this.abilities[i] && this.mutations[i]) {
-        this.useAbility(i);
-      }
-    }
+    // Ability activation — driven by game.ts via useAbilitySlot()
 
     // Base tendril attack (E key)
     if (isKeyDown('KeyE') && this.attackCooldown <= 0) {

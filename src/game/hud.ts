@@ -149,10 +149,10 @@ export function renderHud(
   }
 
   // Controls hint — top right
-  ctx.fillStyle = '#555';
+  ctx.fillStyle = '#666';
   ctx.font = '9px monospace';
   ctx.textAlign = 'end';
-  ctx.fillText('WASD:move E:attack 1-4:abilities F:fuse Q:drop Space:descend', canvasW - HUD_PADDING, hpY + HP_BAR_HEIGHT - 1);
+  ctx.fillText('[1-4] Ability  [E] Melee  [F] Fuse  [Q] Drop  [Space] Interact', canvasW - HUD_PADDING, hpY + HP_BAR_HEIGHT - 1);
   ctx.textAlign = 'start';
 
   // Enemy legend — top left below HP
@@ -237,11 +237,15 @@ export function renderHud(
       ctx.fillText('★', sx + SLOT_SIZE - 10, slotsY + 10);
     }
 
-    // Key number
-    ctx.fillStyle = ability && ability.cooldown <= 0 ? '#aaa' : '#555';
-    ctx.font = '9px monospace';
+    // Key number with background pill
+    const keyReady = ability && ability.cooldown <= 0;
+    ctx.fillStyle = keyReady ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.3)';
+    ctx.fillRect(sx + 1, slotsY + 1, 11, 11);
+    ctx.fillStyle = keyReady ? '#ddd' : '#666';
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${i + 1}`, sx + 7, slotsY + 10);
     ctx.textAlign = 'start';
-    ctx.fillText(`${i + 1}`, sx + 2, slotsY + 10);
 
     // Rarity dot in top-right corner of slot
     if (mutation) {
@@ -406,30 +410,34 @@ function renderSynergies(ctx: CanvasRenderingContext2D, canvasW: number, player:
   const x = canvasW - HUD_PADDING;
   let y = 36;
 
-  ctx.fillStyle = '#666';
-  ctx.font = '8px monospace';
+  // Background panel
+  const panelH = synergies.length * 24 + 18;
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(x - 150, y - 12, 154, panelH);
+
+  ctx.fillStyle = '#777';
+  ctx.font = 'bold 9px monospace';
   ctx.textAlign = 'end';
-  ctx.fillText('SYNERGIES', x, y);
-  y += 4;
+  ctx.fillText('SYNERGIES', x - 2, y);
+  y += 6;
 
   for (const syn of synergies) {
-    y += 12;
+    y += 13;
     if (syn.isEvolution) {
-      // Gold star prefix for evolutions
       ctx.fillStyle = '#ffcc00';
-      ctx.font = 'bold 8px monospace';
+      ctx.font = 'bold 9px monospace';
       ctx.textAlign = 'end';
-      ctx.fillText(`★ ${syn.name}`, x, y);
+      ctx.fillText(`★ ${syn.name}`, x - 2, y);
     } else {
       ctx.fillStyle = syn.color;
-      ctx.font = 'bold 8px monospace';
+      ctx.font = 'bold 9px monospace';
       ctx.textAlign = 'end';
-      ctx.fillText(`${syn.name}`, x, y);
+      ctx.fillText(`${syn.name}`, x - 2, y);
     }
-    y += 10;
-    ctx.fillStyle = syn.isEvolution ? '#aa9944' : '#888';
-    ctx.font = '7px monospace';
-    ctx.fillText(syn.description, x, y);
+    y += 11;
+    ctx.fillStyle = syn.isEvolution ? '#bb9944' : '#999';
+    ctx.font = '8px monospace';
+    ctx.fillText(syn.description, x - 2, y);
   }
 
   ctx.textAlign = 'start';
