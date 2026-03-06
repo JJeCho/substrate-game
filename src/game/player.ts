@@ -344,9 +344,12 @@ export class Player {
     return true;
   }
 
-  /** Trigger overload: self-damage + enter overloaded state. */
+  /** Trigger overload: self-damage + enter overloaded state. Cost scales with synergy count. */
   triggerOverload(): void {
-    const selfDmg = Math.round(this.maxHp * 0.15);
+    // Base cost: 15% HP. +4% per active synergy beyond 2, capped at 35%
+    const synergyCount = this.synergies.synergies.length + this.synergies.evolutions.length;
+    const costPct = Math.min(0.35, 0.15 + Math.max(0, synergyCount - 2) * 0.04);
+    const selfDmg = Math.round(this.maxHp * costPct);
     this.hp = Math.max(1, this.hp - selfDmg);
     this.overloadTimer = 15; // 15 seconds of power
     this.overloadCooldown = 30;
@@ -399,6 +402,9 @@ export class Player {
     // Mercury: +30% speed during overload (applied in movement)
     if (this.coreMutations.has(5) && this.overloadTimer > 0) this.speed *= 1.3;
 
+    // Cooldown floor: can't go below 35% of base cooldown
+    this.synergies.cooldownMult = Math.max(0.35, this.synergies.cooldownMult);
+
     this.hp = Math.min(this.hp, this.maxHp);
   }
 
@@ -445,8 +451,8 @@ export class Player {
     }
   }
 
-  takeDamage(amount: number): void {
-    if (this.shieldTimer > 0) amount = Math.round(amount * 0.3);
+  takeDamage(amount: number, ignoreShield = false): void {
+    if (this.shieldTimer > 0 && !ignoreShield) amount = Math.round(amount * 0.3);
     this.hp = Math.max(0, this.hp - amount);
     this.flashTimer = 0.15;
     if (this.hp <= 0) this.dead = true;

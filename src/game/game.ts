@@ -19,6 +19,14 @@ import { loadProgress, saveProgress, calculateRunReward, getUpgradeLevel, canBuy
 import type { MetaProgress, RunRecord } from './progression';
 import { EVOLUTION_RECIPES } from './evolutions';
 
+/** Asymptotic soft-cap: linear below knee, diminishing above, approaching hardCap. */
+function softCap(raw: number, knee: number, hardCap: number): number {
+  if (raw <= knee) return raw;
+  const excess = raw - knee;
+  const range = hardCap - knee;
+  return knee + range * (1 - Math.exp(-excess / range));
+}
+
 export class Game {
   private ctx: CanvasRenderingContext2D;
   private canvasW: number;
@@ -263,6 +271,13 @@ export class Game {
       boss.onShoot = (p) => this.projectiles.push(p);
       boss.onBossSlam = () => this.handleBossSlam(boss);
       boss.onBossSummon = () => this.handleBossSummon(boss);
+      boss.onBossEnrage = () => {
+        addFloatingText(boss.px, boss.py - TILE_SIZE * 2, 'ENRAGED!', '#ff2222', 3.0);
+        addRing(boss.px, boss.py, TILE_SIZE * 5, '#ff2222', 0.8);
+        addRing(boss.px, boss.py, TILE_SIZE * 3, '#ff8800', 0.6);
+        addFlash(boss.px, boss.py, TILE_SIZE * 4, '#ff4400', 0.3);
+        this.camera.shake(10, 0.6);
+      };
       boss.onMeleeHit = (dmg) => {
         addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `-${dmg}`, '#ff6666');
       };
@@ -361,7 +376,23 @@ export class Game {
 
   private get comboMult(): number {
     if (this.comboCount <= 0) return 1;
-    return 1 + this.comboCount * 0.15;
+    // Logarithmic scaling: first few kills matter, then diminishes
+    // 5 kills: 1.79x, 10: 2.23x, 20: 2.72x (was 1.75/2.5/4.0)
+    return 1 + 0.5 * Math.log2(1 + this.comboCount);
+  }
+
+  /** Centralized damage multiplier with soft caps on both synergy and combo. */
+  private getEffectiveDamageMult(): number {
+    const cappedDmg = softCap(this.player.synergies.damageMult, 1.8, 3.0);
+    const cappedCombo = softCap(this.comboMult, 2.0, 3.5);
+    return cappedDmg * cappedCombo;
+  }
+
+  /** Lifesteal healing efficiency: full below 70% HP, diminishes to 20% at max HP. */
+  private getHealEfficiency(): number {
+    const ratio = this.player.hp / this.player.maxHp;
+    if (ratio < 0.7) return 1.0;
+    return 1.0 - (ratio - 0.7) / 0.3 * 0.8;
   }
 
   start(): void {
@@ -603,7 +634,7 @@ export class Game {
       if (beam.tickTimer <= 0) {
         beam.tickTimer = 0.15;
         // Line trace and damage enemies
-        const dmgMult = this.player.synergies.damageMult * this.comboMult;
+        const dmgMult = this.getEffectiveDamageMult();
         for (let step = 1; step <= beam.range / TILE_SIZE; step++) {
           const bx = beam.x + beam.dx * step * TILE_SIZE;
           const by = beam.y + beam.dy * step * TILE_SIZE;
@@ -619,7 +650,10 @@ export class Game {
               const finalDmg = Math.round(beam.damage * 0.3 * dmgMult);
               enemy.takeDamage(finalDmg);
               addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, '#ff4444', 0.3);
-              if (beam.lifesteal > 0) this.player.heal(Math.round(finalDmg * beam.lifesteal));
+              if (beam.lifesteal > 0) {
+                const cappedLs = Math.min(beam.lifesteal, 0.50);
+                this.player.heal(Math.round(finalDmg * cappedLs * this.getHealEfficiency()));
+              }
               if (beam.statusEffect) this.applyBoostedStatus(enemy, beam.statusEffect);
               if (enemy.dead) this.onEnemyDeath(enemy);
             }
@@ -652,7 +686,7 @@ export class Game {
       const ally = this.allies[i];
       const attacked = ally.update(dt, this.map, this.enemies);
       if (attacked) {
-        const dmgMult = this.player.synergies.damageMult;
+        const dmgMult = softCap(this.player.synergies.damageMult, 1.8, 3.0);
         const finalDmg = Math.round(ally.damage * dmgMult);
         attacked.takeDamage(finalDmg);
         addFloatingText(attacked.px, attacked.py - TILE_SIZE * 0.5, `-${finalDmg}`, '#44ffaa', 0.5);
@@ -831,7 +865,7 @@ export class Game {
     // Quantum Shield: reflect enemy projectiles off temporary walls
     const hasQuantumShield = this.player.synergies.evolutions.some(e => e.recipe.id === 'quantum_shield');
 
-    const dmgMult = this.player.synergies.damageMult * this.comboMult;
+    const dmgMult = this.getEffectiveDamageMult();
     for (const proj of this.projectiles) {
       const prevX = proj.x;
       const prevY = proj.y;
@@ -873,10 +907,10 @@ export class Game {
             addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, dmgColor);
             addFlash(enemy.px, enemy.py, TILE_SIZE * 0.3, '#ffffff');
             this.camera.shake(2, 0.1);
-            const totalLs = proj.lifesteal + this.player.synergies.lifestealBonus;
+            const totalLs = Math.min(proj.lifesteal + this.player.synergies.lifestealBonus, 0.50);
             if (totalLs > 0) {
-              const healed = Math.round(finalDmg * totalLs);
-              this.player.heal(healed);
+              const healed = Math.round(finalDmg * totalLs * this.getHealEfficiency());
+              if (healed > 0) this.player.heal(healed);
               addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `+${healed}`, '#44ff44');
             }
             // Apply synergy-boosted status effect from projectile
@@ -1120,9 +1154,9 @@ export class Game {
 
     // --- Floor-scaling damage ---
     const floorScale = 1 + this.floor * 0.2;
-    const dmgMult = this.player.synergies.damageMult * this.comboMult;
+    const dmgMult = this.getEffectiveDamageMult();
     const baseDmg = this.player.tendrilBaseDamage * floorScale;
-    const lifestealPct = 0.1 + this.player.synergies.lifestealBonus; // 10% innate + synergy bonus
+    const lifestealPct = Math.min(0.1 + this.player.synergies.lifestealBonus, 0.50); // capped at 50%
 
     let totalDamageDealt = 0;
 
@@ -1174,7 +1208,7 @@ export class Game {
 
     // --- Innate lifesteal ---
     if (totalDamageDealt > 0 && lifestealPct > 0) {
-      const healed = Math.round(totalDamageDealt * lifestealPct);
+      const healed = Math.round(totalDamageDealt * lifestealPct * this.getHealEfficiency());
       if (healed > 0) {
         this.player.heal(healed);
         addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `+${healed}`, '#44ff88');
@@ -1183,7 +1217,7 @@ export class Game {
   }
 
   private handleDashDamage(damage: number, lifesteal: number, effect?: AbilityEffect): void {
-    const dmgMult = this.player.synergies.damageMult * this.comboMult;
+    const dmgMult = this.getEffectiveDamageMult();
     addTrail(this.player.px, this.player.py, '#ff3333');
     addRing(this.player.px, this.player.py, TILE_SIZE * 1.5, '#ff3333', 0.3);
     this.camera.shake(3, 0.15);
@@ -1194,10 +1228,10 @@ export class Game {
         enemy.takeDamage(finalDmg);
         addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, '#ff4444');
         addFlash(enemy.px, enemy.py, TILE_SIZE * 0.4, '#ff3333');
-        const totalLs = lifesteal + this.player.synergies.lifestealBonus;
+        const totalLs = Math.min(lifesteal + this.player.synergies.lifestealBonus, 0.50);
         if (totalLs > 0) {
-          const healed = Math.round(finalDmg * totalLs);
-          this.player.heal(healed);
+          const healed = Math.round(finalDmg * totalLs * this.getHealEfficiency());
+          if (healed > 0) this.player.heal(healed);
           addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `+${healed}`, '#44ff44');
         }
         if (enemy.dead) this.onEnemyDeath(enemy);
@@ -1221,7 +1255,7 @@ export class Game {
     addFloatingText(this.player.px, this.player.py - TILE_SIZE, 'PULSE!', '#33ff66', 0.6);
     addRing(this.player.px, this.player.py, radius, '#33ff66', 0.5);
     this.camera.shake(3, 0.2);
-    const dmgMult = this.player.synergies.damageMult * this.comboMult;
+    const dmgMult = this.getEffectiveDamageMult();
     for (const enemy of this.enemies) {
       if (enemy.dead) continue;
       const dx = enemy.px - this.player.px;
@@ -1233,9 +1267,10 @@ export class Game {
         addFlash(enemy.px, enemy.py, TILE_SIZE * 0.3, '#33ff66');
         let totalLs = lifesteal + this.player.synergies.lifestealBonus;
         if (effect?.healsOnHit) totalLs += 0.25; // Life Engine: +25% healing
+        totalLs = Math.min(totalLs, 0.50);
         if (totalLs > 0) {
-          const healed = Math.round(finalDmg * totalLs);
-          this.player.heal(healed);
+          const healed = Math.round(finalDmg * totalLs * this.getHealEfficiency());
+          if (healed > 0) this.player.heal(healed);
           addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `+${healed}`, '#44ff44');
         }
         if (enemy.dead) this.onEnemyDeath(enemy);
@@ -1258,7 +1293,7 @@ export class Game {
     addRing(x, y, radius, '#ff8800', 0.4);
     addFlash(x, y, radius * 0.5, '#ff4400', 0.2);
     this.camera.shake(5, 0.25);
-    const dmgMult = this.player.synergies.damageMult * this.comboMult;
+    const dmgMult = this.getEffectiveDamageMult();
     for (const enemy of this.enemies) {
       if (enemy.dead) continue;
       const dx = enemy.px - x;
@@ -1267,7 +1302,11 @@ export class Game {
         const finalDmg = Math.round(damage * dmgMult);
         enemy.takeDamage(finalDmg);
         addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, '#ff4444');
-        if (lifesteal > 0) this.player.heal(Math.round(damage * lifesteal));
+        if (lifesteal > 0) {
+          const cappedLs = Math.min(lifesteal, 0.50);
+          const expHealed = Math.round(damage * cappedLs * this.getHealEfficiency());
+          if (expHealed > 0) this.player.heal(expHealed);
+        }
         if (enemy.dead) this.onEnemyDeath(enemy);
       }
     }
@@ -1275,11 +1314,14 @@ export class Game {
 
   private handleBossSlam(boss: Enemy): void {
     const slamRadius = TILE_SIZE * 3;
-    const slamDmg = boss.damage;
-    addFloatingText(boss.px, boss.py - TILE_SIZE * 1.5, 'SLAM!', '#ff4488', 1.0);
+    // Boss slams deal flat damage + %HP damage (enraged bosses deal more)
+    const pctDmg = Math.round(this.player.maxHp * (boss.bossEnraged ? 0.20 : 0.12));
+    const slamDmg = boss.damage + pctDmg;
+    const label = boss.bossEnraged ? 'ENRAGED SLAM!' : 'SLAM!';
+    addFloatingText(boss.px, boss.py - TILE_SIZE * 1.5, label, '#ff4488', 1.0);
     addRing(boss.px, boss.py, slamRadius, '#ff4488', 0.5);
     addFlash(boss.px, boss.py, slamRadius * 0.5, '#ff2266', 0.2);
-    this.camera.shake(8, 0.4);
+    this.camera.shake(boss.bossEnraged ? 12 : 8, boss.bossEnraged ? 0.6 : 0.4);
 
     const dx = this.player.px - boss.px;
     const dy = this.player.py - boss.py;
@@ -1390,7 +1432,8 @@ export class Game {
       addFloatingText(this.player.px, this.player.py - TILE_SIZE * 1.5,
         `${this.comboCount}x COMBO!`, '#ffcc00', 1.0);
       this.camera.shake(4, 0.2);
-      this.player.heal(Math.round((3 + this.floor) * this.comboCount));
+      const comboHeal = Math.min(25, Math.round((3 + this.floor) * Math.sqrt(this.comboCount)));
+      this.player.heal(comboHeal);
     }
 
     // Boss death

@@ -21,6 +21,14 @@ function randInt(min: number, max: number): number {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+/** Non-linear enemy scaling: linear early, quadratic acceleration after floor 4. */
+function enemyFloorScale(floor: number): number {
+  if (floor <= 1) return 1;
+  const linear = 1 + (floor - 1) * 0.15;
+  const accel = floor > 4 ? 0.025 * (floor - 4) * (floor - 4) : 0;
+  return linear + accel;
+}
+
 export class Enemy {
   x: number;
   y: number;
@@ -48,6 +56,13 @@ export class Enemy {
   // Elite flag
   isElite = false;
 
+  // Late-floor traits
+  hasShieldBreak = false;   // Attacks bypass player shield
+  hasDodge = false;         // 25% chance to avoid incoming damage
+  hasEnrage = false;        // +50% speed/damage below 40% HP
+  isEnraged = false;        // Currently enraged (low HP)
+  floorDepth = 1;           // Track floor for scaling behaviors
+
   // Boss fields
   isBoss = false;
   bossType: number = BossType.IronGuardian;
@@ -56,6 +71,8 @@ export class Enemy {
   bossShieldTimer = 0;
   bossTeleportCooldown = 0;
   bossSummonCooldown = 0;
+  bossEnrageTimer = 0;
+  bossEnraged = false;
 
   // Callbacks
   onShoot: ((p: Projectile) => void) | null = null;
@@ -64,6 +81,7 @@ export class Enemy {
   onMeleeHit: ((damage: number) => void) | null = null;
   onBossTeleport: (() => void) | null = null;
   onPoisonTrail: (() => void) | null = null;
+  onBossEnrage: (() => void) | null = null;
 
   // Movement interpolation
   private moving = false;
@@ -100,7 +118,8 @@ export class Enemy {
 
   static createBoss(tileX: number, tileY: number, floorDepth: number): Enemy {
     const boss = new Enemy(tileX, tileY, 'boss');
-    const scale = 1 + (floorDepth - 1) * 0.2;
+    // Non-linear boss scaling: accelerates after floor 3
+    const scale = 1 + (floorDepth - 1) * 0.2 + (floorDepth > 3 ? 0.04 * (floorDepth - 3) * (floorDepth - 3) : 0);
 
     // Select boss type based on floor
     const cycle = Math.floor((floorDepth - 1) / 3) % 3;
@@ -129,6 +148,13 @@ export class Enemy {
     this.shootCooldown = Math.max(0, this.shootCooldown - dt);
     this.flashTimer = Math.max(0, this.flashTimer - dt);
     this.pathAge += dt;
+
+    // Enrage trait: enemies gain speed and damage below 40% HP
+    if (this.hasEnrage && !this.isEnraged && this.hp < this.maxHp * 0.4) {
+      this.isEnraged = true;
+      this.speed *= 1.5;
+      this.damage = Math.round(this.damage * 1.5);
+    }
 
     // Apply slow from status effects
     let speedMult = 1;
@@ -180,7 +206,7 @@ export class Enemy {
 
     switch (this.state) {
       case 'attack':
-        player.takeDamage(this.damage);
+        player.takeDamage(this.damage, this.hasShieldBreak);
         this.onMeleeHit?.(this.damage);
         // Mutated enemies apply status effects
         if (this.mutation) {
@@ -194,14 +220,22 @@ export class Enemy {
         const pdy = player.py - this.py;
         const len = Math.sqrt(pdx * pdx + pdy * pdy);
         if (len > 0 && this.onShoot) {
-          const proj = new Projectile(this.px, this.py, pdx / len, pdy / len, {
-            speed: TILE_SIZE * 6,
-            damage: this.damage,
-            lifetime: 1.2,
-            color: this.mutation ? ELEMENT_COLORS[this.mutation.element] : this.baseColor,
-            fromPlayer: false,
-          });
-          this.onShoot(proj);
+          const baseAngle = Math.atan2(pdy, pdx);
+          // Floor 7+: fire 2 projectiles, Floor 11+: fire 3
+          const shotCount = this.floorDepth >= 11 ? 3 : this.floorDepth >= 7 ? 2 : 1;
+          const spreadStep = 0.25; // ~14 degrees between shots
+          for (let s = 0; s < shotCount; s++) {
+            const offset = (s - (shotCount - 1) / 2) * spreadStep;
+            const angle = baseAngle + offset;
+            const proj = new Projectile(this.px, this.py, Math.cos(angle), Math.sin(angle), {
+              speed: TILE_SIZE * 6,
+              damage: this.damage,
+              lifetime: 1.2,
+              color: this.mutation ? ELEMENT_COLORS[this.mutation.element] : this.baseColor,
+              fromPlayer: false,
+            });
+            this.onShoot(proj);
+          }
         }
         this.shootCooldown = 1.8;
         this.moveAwayFrom(player.x, player.y, map);
@@ -241,6 +275,21 @@ export class Enemy {
     this.bossShieldTimer = Math.max(0, this.bossShieldTimer - dt);
     this.bossTeleportCooldown = Math.max(0, this.bossTeleportCooldown - dt);
     this.bossSummonCooldown = Math.max(0, this.bossSummonCooldown - dt);
+
+    // Boss enrage: after 45 seconds of combat, +100% damage, +50% speed
+    if (!this.bossEnraged) {
+      const distToPlayer = Math.abs(this.x - player.x) + Math.abs(this.y - player.y);
+      if (distToPlayer <= this.sightRange + 3) {
+        this.bossEnrageTimer += dt;
+        if (this.bossEnrageTimer >= 45) {
+          this.bossEnraged = true;
+          this.speed *= 1.5;
+          this.damage = Math.round(this.damage * 2);
+          this.onBossEnrage?.();
+        }
+      }
+    }
+
     if (this.bossAttackTimer > 0) return;
 
     const dist = Math.abs(this.x - player.x) + Math.abs(this.y - player.y);
@@ -510,6 +559,11 @@ export class Enemy {
 
   takeDamage(amount: number): void {
     if (this.isDamageReduced) amount = Math.round(amount * 0.3);
+    // Dodge: 25% chance for trait-bearing enemies to avoid damage
+    if (this.hasDodge && !this.isBoss && Math.random() < 0.25) {
+      this.flashTimer = 0.1;
+      return;
+    }
     this.hp -= amount;
     this.flashTimer = 0.15;
     if (this.hp <= 0) {
@@ -695,20 +749,26 @@ export function spawnEnemies(rooms: Room[], map: GameMap, floorDepth: number = 1
           const occupied = enemies.some(e => e.x === ex && e.y === ey);
           if (!occupied) {
             const enemy = new Enemy(ex, ey, types[randInt(0, 2)]);
+            enemy.floorDepth = floorDepth;
             if (floorDepth > 1) {
-              const scale = 1 + (floorDepth - 1) * 0.15;
+              const scale = enemyFloorScale(floorDepth);
               enemy.hp = Math.round(enemy.hp * scale);
               enemy.maxHp = enemy.hp;
               enemy.damage = Math.round(enemy.damage * scale);
             }
-            // Elite promotion: 15% chance on floor 2+
-            if (floorDepth >= 2 && Math.random() < 0.15) {
+            // Elite promotion: scaling chance (10% base + 2.5%/floor, caps at 45%)
+            const eliteChance = Math.min(0.45, 0.10 + floorDepth * 0.025);
+            if (floorDepth >= 2 && Math.random() < eliteChance) {
               enemy.isElite = true;
-              enemy.hp = Math.round(enemy.hp * 2);
+              enemy.hp = Math.round(enemy.hp * 2.5);
               enemy.maxHp = enemy.hp;
-              enemy.damage = Math.round(enemy.damage * 1.5);
-              enemy.speed *= 1.2;
+              enemy.damage = Math.round(enemy.damage * 1.8);
+              enemy.speed *= 1.3;
             }
+            // Late-floor traits
+            if (floorDepth >= 7 && Math.random() < 0.15) enemy.hasShieldBreak = true;
+            if (floorDepth >= 9 && Math.random() < 0.12) enemy.hasDodge = true;
+            if (floorDepth >= 11 && Math.random() < 0.20) enemy.hasEnrage = true;
             enemies.push(enemy);
             break;
           }
