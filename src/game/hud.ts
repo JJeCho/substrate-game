@@ -1,10 +1,20 @@
 import { MUTATION_SLOTS, MUTATION_DECAY_TIME, COLORS, ELEMENT_COLORS, ELEMENT_NAMES, MODIFIER_NAMES, RARITY_NAMES, RARITY_COLORS, STATUS_COLORS, STATUS_NAMES, BUFF_COLORS, BUFF_NAMES } from './constants';
 import { Element, Modifier } from './types';
 import { getAbilityDescription } from './abilities';
+import { evaluateSynergies } from './synergy';
 import type { ActiveBuff } from './types';
 import type { Player } from './player';
 import type { Mineral } from './minerals';
 import type { Enemy } from './enemy';
+
+const PASSIVE_PERKS: Record<number, string> = {
+  0: 'Passive: +5 max HP',
+  1: 'Passive: +5% speed',
+  2: 'Passive: +10% damage',
+  3: 'Passive: -10% cooldown',
+  4: 'Passive: +5% lifesteal',
+  5: 'Passive: minimap reveals enemies',
+};
 
 /** Maps element to ability type for evolution star matching */
 const ELEM_TO_TYPE: Record<number, string> = {
@@ -327,7 +337,7 @@ export function renderHud(
 
     // Background panel
     const panelW = 280;
-    const panelH = fused ? 32 : 28;
+    const panelH = fused ? 44 : 40;
     const panelX = canvasW / 2 - panelW / 2;
     const panelY = slotsY - panelH - 8;
     ctx.fillStyle = 'rgba(0,0,0,0.75)';
@@ -354,12 +364,18 @@ export function renderHud(
     ctx.font = '9px monospace';
     ctx.fillText(desc, canvasW / 2, panelY + 24);
 
+    // Line 3: passive perk
+    const passiveText = PASSIVE_PERKS[selectedMutation.element] || '';
+    ctx.fillStyle = '#88aacc';
+    ctx.font = '8px monospace';
+    ctx.fillText(passiveText, canvasW / 2, panelY + 35);
+
     ctx.textAlign = 'start';
   }
 
   // Nearby mineral tooltip
   if (nearbyMineral) {
-    renderMineralTooltip(ctx, nearbyMineral, canvasW, slotsY);
+    renderMineralTooltip(ctx, nearbyMineral, canvasW, slotsY, player);
   }
 
   // Core mutations indicator
@@ -368,17 +384,33 @@ export function renderHud(
   }
 }
 
-function renderMineralTooltip(ctx: CanvasRenderingContext2D, mineral: Mineral, canvasW: number, slotsY: number): void {
+function renderMineralTooltip(ctx: CanvasRenderingContext2D, mineral: Mineral, canvasW: number, slotsY: number, player: Player): void {
   const d = mineral.data;
   const name = `${MODIFIER_NAMES[d.modifier]} ${ELEMENT_NAMES[d.element]}`;
   const rarity = RARITY_NAMES[d.rarity];
   const color = ELEMENT_COLORS[d.element];
   const desc = getAbilityDescription(d);
 
+  // Compute synergy diff
+  const hasEmptySlot = player.mutations.some(m => m === null);
+  let gained: { name: string; color: string }[] = [];
+  let lost: { name: string }[] = [];
+  if (hasEmptySlot) {
+    const simMutations = [...player.mutations];
+    const emptyIdx = simMutations.indexOf(null);
+    simMutations[emptyIdx] = d;
+    const currentNames = new Set(player.synergies.synergies.map(s => s.name));
+    const simResult = evaluateSynergies(simMutations, player.discoveredEvolutions);
+    const newNames = new Set(simResult.synergies.map(s => s.name));
+    gained = simResult.synergies.filter(s => !currentNames.has(s.name)).map(s => ({ name: s.name, color: s.color }));
+    lost = player.synergies.synergies.filter(s => !newNames.has(s.name));
+  }
+
+  const diffLines = gained.length + lost.length;
   const panelW = 260;
-  const panelH = 30;
+  const panelH = 30 + diffLines * 10;
   const panelX = canvasW / 2 - panelW / 2;
-  const panelY = slotsY - 52 - panelH;
+  const panelY = slotsY - 60 - panelH;
 
   ctx.fillStyle = 'rgba(0,0,0,0.75)';
   ctx.fillRect(panelX, panelY, panelW, panelH);
@@ -387,7 +419,6 @@ function renderMineralTooltip(ctx: CanvasRenderingContext2D, mineral: Mineral, c
   ctx.strokeRect(panelX, panelY, panelW, panelH);
 
   ctx.font = 'bold 10px monospace';
-  // Mineral name in element color, rarity in rarity color
   const nameText = `NEARBY: ${name} `;
   const rarityText = `[${rarity}]`;
   const fullW = ctx.measureText(nameText + rarityText).width;
@@ -400,6 +431,21 @@ function renderMineralTooltip(ctx: CanvasRenderingContext2D, mineral: Mineral, c
   ctx.fillStyle = '#99aaaa';
   ctx.font = '8px monospace';
   ctx.fillText(`Gives: ${desc}`, canvasW / 2, panelY + 24);
+
+  // Synergy diff
+  let lineY = panelY + 34;
+  for (const s of gained) {
+    ctx.fillStyle = '#44ff44';
+    ctx.font = '8px monospace';
+    ctx.fillText(`+ ${s.name}`, panelX + 6, lineY);
+    lineY += 10;
+  }
+  for (const s of lost) {
+    ctx.fillStyle = '#ff4444';
+    ctx.font = '8px monospace';
+    ctx.fillText(`- ${s.name}`, panelX + 6, lineY);
+    lineY += 10;
+  }
   ctx.textAlign = 'start';
 }
 
@@ -487,10 +533,10 @@ function renderBossHpBar(ctx: CanvasRenderingContext2D, canvasW: number, boss: E
   ctx.fillRect(barX - 4, barY - 14, barW + 8, barH + 18);
 
   // Label
-  ctx.fillStyle = '#ff88aa';
+  ctx.fillStyle = boss.baseColor + 'cc';
   ctx.font = 'bold 9px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText('SUBSTRATE GUARDIAN', canvasW / 2, barY - 3);
+  ctx.fillText(boss.bossName, canvasW / 2, barY - 3);
 
   // Bar bg
   ctx.fillStyle = '#330011';
@@ -515,14 +561,17 @@ function renderBossHpBar(ctx: CanvasRenderingContext2D, canvasW: number, boss: E
 
 function renderEnemyLegend(ctx: CanvasRenderingContext2D, x: number, y: number, visibleEnemies: Enemy[]): void {
   const typeCounts = new Map<string, number>();
+  let eliteCount = 0;
   for (const e of visibleEnemies) {
     typeCounts.set(e.type, (typeCounts.get(e.type) || 0) + 1);
+    if (e.isElite && !e.isBoss) eliteCount++;
   }
 
   if (typeCounts.size === 0) return;
 
+  const rows = typeCounts.size + (eliteCount > 0 ? 1 : 0);
   ctx.fillStyle = 'rgba(0,0,0,0.5)';
-  ctx.fillRect(x, y, 160, typeCounts.size * 14 + 4);
+  ctx.fillRect(x, y, 160, rows * 14 + 4);
 
   let row = 0;
   const typeInfo: Record<string, { color: string; desc: string }> = {
@@ -562,5 +611,19 @@ function renderEnemyLegend(ctx: CanvasRenderingContext2D, x: number, y: number, 
     ctx.fillText(`×${count} ${info.desc}`, x + 16, ry);
 
     row++;
+  }
+
+  // Elite row
+  if (eliteCount > 0) {
+    const ry = y + 12 + row * 14;
+    ctx.fillStyle = '#ffcc44';
+    ctx.beginPath();
+    ctx.arc(x + 8, ry - 3, 5, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffcc44';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = '#ffcc44';
+    ctx.font = '8px monospace';
+    ctx.fillText(`×${eliteCount} ELITE (stronger)`, x + 16, ry);
   }
 }

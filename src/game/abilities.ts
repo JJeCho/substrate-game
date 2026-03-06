@@ -238,6 +238,11 @@ function applyModifierTwist(effect: AbilityEffect, modifier: number, scale: numb
       effect.radius *= 1 + 1 * scale;
       effect.damage = Math.round(effect.damage * (1 - 0.2 * scale));
       break;
+    case Modifier.Crystalline:
+      // Crystalline: slower CD (applied in createAbility), but +50% AoE radius and +20% damage
+      effect.radius *= 1 + 0.5 * scale;
+      effect.damage = Math.round(effect.damage * (1 + 0.2 * scale));
+      break;
     case Modifier.Parasitic:
       effect.lifesteal += 0.3 * scale;
       break;
@@ -249,7 +254,12 @@ function applyModifierTwist(effect: AbilityEffect, modifier: number, scale: numb
       effect.damage = Math.round(effect.damage * (1 + 0.3 * scale));
       break;
     case Modifier.Null:
-      effect.damage = Math.round(effect.damage * (1 - 0.5 * scale));
+      // Null: -30% damage, but +20% lifesteal and applies Slow
+      effect.damage = Math.round(effect.damage * (1 - 0.3 * scale));
+      effect.lifesteal += 0.2 * scale;
+      if (!effect.statusEffect) {
+        effect.statusEffect = { type: StatusType.Slow, duration: 2 * scale, tickTimer: 0, tickDamage: 0, slowFactor: 0.5 };
+      }
       break;
     case Modifier.Primordial:
       effect.damage = Math.round(effect.damage * (1 + 0.5 * scale));

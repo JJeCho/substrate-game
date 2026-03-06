@@ -17,19 +17,19 @@ function randModifier(): Modifier {
   return vals[randInt(0, vals.length - 1)];
 }
 
-function randRarity(floorDepth: number): Rarity {
-  const roll = Math.random() + floorDepth * 0.05;
+function randRarity(floorDepth: number, rarityBonus: number = 0): Rarity {
+  const roll = Math.random() + floorDepth * 0.05 + rarityBonus;
   if (roll > 0.95) return Rarity.Primordial;
   if (roll > 0.75) return Rarity.Rare;
   if (roll > 0.45) return Rarity.Uncommon;
   return Rarity.Common;
 }
 
-export function generateMineral(floorDepth: number): MineralData {
+export function generateMineral(floorDepth: number, rarityBonus: number = 0): MineralData {
   return {
     element: randElement(),
     modifier: randModifier(),
-    rarity: randRarity(floorDepth),
+    rarity: randRarity(floorDepth, rarityBonus),
   };
 }
 
@@ -184,10 +184,13 @@ export function spawnHealthPickups(rooms: Room[], map: GameMap, floorDepth: numb
   return pickups;
 }
 
-export function spawnMinerals(rooms: TaggedRoom[], map: GameMap, floorDepth: number = 1): Mineral[] {
+export function spawnMinerals(rooms: TaggedRoom[], map: GameMap, floorDepth: number = 1, rarityBonus: number = 0): Mineral[] {
   const minerals: Mineral[] = [];
 
   for (const room of rooms) {
+    // Secret rooms have substrate caches instead of minerals
+    if (room.roomType === RoomType.Secret) continue;
+
     // Treasure rooms: 3-5 minerals, rarity >= Uncommon
     // Mineral-rich rooms: 2-4 minerals
     // Normal/Trap: 1-3 minerals
@@ -209,7 +212,7 @@ export function spawnMinerals(rooms: TaggedRoom[], map: GameMap, floorDepth: num
         if (map[my][mx] === TileType.Floor || map[my][mx] === TileType.TrapFloor) {
           const occupied = minerals.some(m => m.x === mx && m.y === my);
           if (!occupied) {
-            const data = generateMineral(floorDepth);
+            const data = generateMineral(floorDepth, rarityBonus);
             if (minRarity > 0 && data.rarity < minRarity) {
               data.rarity = minRarity as MineralData['rarity'];
             }

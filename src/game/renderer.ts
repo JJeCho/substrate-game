@@ -11,6 +11,7 @@ const ROOM_TINTS: Record<number, string> = {
   [RoomType.MineralRich]: 'rgba(50,200,255,0.10)',
   [RoomType.Shrine]: 'rgba(200,150,255,0.15)',
   [RoomType.Shop]: 'rgba(255,215,0,0.15)',
+  [RoomType.Secret]: 'rgba(0,255,180,0.12)',
 };
 
 export function renderMap(
@@ -69,6 +70,9 @@ export function renderMap(
         case TileType.LockedDoor:
           ctx.fillStyle = '#8B7355';
           break;
+        case TileType.CrackedWall:
+          ctx.fillStyle = '#1e1e35';
+          break;
       }
 
       ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
@@ -112,6 +116,21 @@ export function renderMap(
         const shimmer = 0.05 + Math.sin((x * 2.1 + y * 4.7) + Date.now() * 0.002) * 0.05;
         ctx.fillStyle = `rgba(100,180,255,${shimmer})`;
         ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
+      }
+
+      // Cracked wall detail
+      if (tile === TileType.CrackedWall && dist <= VISION_RADIUS) {
+        ctx.strokeStyle = '#2a2a48';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(sx + 3, sy + 2);
+        ctx.lineTo(sx + TILE_SIZE / 2, sy + TILE_SIZE / 2);
+        ctx.lineTo(sx + TILE_SIZE - 3, sy + TILE_SIZE - 2);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(sx + TILE_SIZE / 2, sy + TILE_SIZE / 2);
+        ctx.lineTo(sx + 2, sy + TILE_SIZE - 3);
+        ctx.stroke();
       }
 
       // Locked door keyhole

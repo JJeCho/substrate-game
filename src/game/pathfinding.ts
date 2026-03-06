@@ -68,7 +68,7 @@ export function findPath(
       const ny = current.y + ddy;
 
       if (nx < 0 || nx >= MAP_WIDTH || ny < 0 || ny >= MAP_HEIGHT) continue;
-      if (map[ny][nx] === TileType.Wall) continue;
+      if (map[ny][nx] === TileType.Wall || map[ny][nx] === TileType.CrackedWall || map[ny][nx] === TileType.LockedDoor) continue;
 
       const nk = key(nx, ny);
       if (closed.has(nk)) continue;

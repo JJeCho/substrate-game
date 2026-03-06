@@ -34,6 +34,10 @@ export class Player {
   /** Set of discovered evolution IDs, passed to synergy evaluation */
   discoveredEvolutions: Set<string> = new Set();
 
+  tendrilBaseDamage = 5;     // base melee damage, upgraded by Tenacity
+  mutationDecayBonus = 0;    // seconds subtracted from decay timer (Quick Adaptation)
+  rarityBonus = 0;           // added to rarity roll (Mineral Affinity)
+
   flashTimer = 0;
   attackCooldown = 0;
 
@@ -64,7 +68,14 @@ export class Player {
 
   update(dt: number, map: GameMap): void {
     this.flashTimer = Math.max(0, this.flashTimer - dt);
-    this.attackCooldown = Math.max(0, this.attackCooldown - dt);
+    // Tendril cooldown scales with synergy cooldown reduction; instant during Overload
+    if (this.attackCooldown > 0) {
+      if (this.overloadTimer > 0) {
+        this.attackCooldown = 0;
+      } else {
+        this.attackCooldown = Math.max(0, this.attackCooldown - dt / Math.max(0.5, this.synergies.cooldownMult));
+      }
+    }
 
     // Tick overload
     if (this.overloadTimer > 0) this.overloadTimer -= dt;
@@ -235,6 +246,7 @@ export class Player {
       this.px = this.x * TILE_SIZE + TILE_SIZE / 2;
       this.py = this.y * TILE_SIZE + TILE_SIZE / 2;
       this.moving = false;
+      this.onTeleport?.();
     } else if (effect.type === 'shield') {
       // Temporary damage reduction
       this.onShieldActivate?.(effect.duration + 1.5, effect);
@@ -272,6 +284,7 @@ export class Player {
   onDashDamage: ((damage: number, lifesteal: number, effect: AbilityEffect) => void) | null = null;
   onAoePulse: ((damage: number, radius: number, lifesteal: number, effect: AbilityEffect) => void) | null = null;
   onShieldActivate: ((duration: number, effect: AbilityEffect) => void) | null = null;
+  onTeleport: (() => void) | null = null;
   onWallPlace: ((tiles: Point[], duration: number, effect: AbilityEffect) => void) | null = null;
   onBeamFire: ((x: number, y: number, dx: number, dy: number, effect: AbilityEffect, color: string) => void) | null = null;
   onSummon: ((x: number, y: number, effect: AbilityEffect, color: string) => void) | null = null;
@@ -281,7 +294,7 @@ export class Player {
   private canMoveTo(x: number, y: number, map: GameMap): boolean {
     if (y < 0 || y >= map.length || x < 0 || x >= map[0].length) return false;
     const tile = map[y][x];
-    return tile !== TileType.Wall && tile !== TileType.LockedDoor;
+    return tile !== TileType.Wall && tile !== TileType.LockedDoor && tile !== TileType.CrackedWall;
   }
 
   consumeMineral(data: MineralData): boolean {
@@ -289,7 +302,7 @@ export class Player {
     if (emptySlot !== -1) {
       this.mutations[emptySlot] = data;
       this.abilities[emptySlot] = createAbility(data);
-      this.mutationTimers[emptySlot] = MUTATION_DECAY_TIME;
+      this.mutationTimers[emptySlot] = MUTATION_DECAY_TIME - this.mutationDecayBonus;
       this.elementCounts[data.element]++;
       // Check for core mutation (3+ of same element)
       if (this.elementCounts[data.element] >= 3 && !this.coreMutations.has(data.element)) {
@@ -353,8 +366,26 @@ export class Player {
     return data;
   }
 
+  get hasMercuryPassive(): boolean {
+    return this.mutations.some(m => m !== null && m.element === 5);
+  }
+
   recalcSynergies(): void {
     this.synergies = evaluateSynergies(this.mutations, this.discoveredEvolutions);
+
+    // Passive mutation perks (per equipped element)
+    for (const m of this.mutations) {
+      if (m === null) continue;
+      switch (m.element) {
+        case 0: this.synergies.maxHpBonus += 5; break;       // Iron: +5 HP
+        case 1: this.synergies.speedMult += 0.05; break;     // Carbon: +5% speed
+        case 2: this.synergies.damageMult += 0.10; break;    // Sulfur: +10% damage
+        case 3: this.synergies.cooldownMult -= 0.10; break;  // Silicon: -10% CD
+        case 4: this.synergies.lifestealBonus += 0.05; break; // Phosphorus: +5% lifesteal
+        // Mercury: minimap reveals enemies (handled in game.ts)
+      }
+    }
+
     // Apply max HP bonus
     this.maxHp = this.baseMaxHp + this.synergies.maxHpBonus;
     this.speed = PLAYER_SPEED * this.synergies.speedMult;
@@ -392,6 +423,10 @@ export class Player {
         }
       }
     }
+    // Reset speed to base before applying slow (prevents compounding each frame)
+    this.speed = PLAYER_SPEED * this.synergies.speedMult;
+    if (this.coreMutations.has(1)) this.speed *= 1.15;
+    if (this.coreMutations.has(5) && this.overloadTimer > 0) this.speed *= 1.3;
     // Apply slow
     const slowEffect = this.statusEffects.find(se => se.type === StatusType.Slow);
     if (slowEffect) {

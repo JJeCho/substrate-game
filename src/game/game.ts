@@ -1,5 +1,5 @@
 import { MAP_WIDTH, MAP_HEIGHT, TILE_SIZE, VISION_RADIUS, COMBO_WINDOW, MUTATION_SLOTS, ELEMENT_COLORS, ELEMENT_NAMES, MODIFIER_NAMES, STATUS_COLORS, STATUS_TICK_INTERVAL } from './constants';
-import { TileType, StatusType, BuffType } from './types';
+import { TileType, StatusType, BuffType, RoomType } from './types';
 import type { GameMap, TaggedRoom, ActiveBuff, Point, StatusEffect } from './types';
 import { generateDungeon } from './dungeon';
 import { Camera } from './camera';
@@ -14,9 +14,9 @@ import { renderHud } from './hud';
 import { facingToDelta } from './abilities';
 import type { AbilityEffect } from './abilities';
 import { addFloatingText, updateFloatingText, renderFloatingText } from './floatingText';
-import { addRing, addFlash, addTrail, updateVfx, renderVfx } from './vfx';
+import { addRing, addFlash, addTrail, addSweep, updateVfx, renderVfx } from './vfx';
 import { loadProgress, saveProgress, calculateRunReward, getUpgradeLevel, canBuyUpgrade, buyUpgrade, UPGRADES } from './progression';
-import type { MetaProgress } from './progression';
+import type { MetaProgress, RunRecord } from './progression';
 import { EVOLUTION_RECIPES } from './evolutions';
 
 export class Game {
@@ -38,6 +38,7 @@ export class Game {
   selectedSlot = 0;
   nearbyMineral: Mineral | null = null;
   floor = 1;
+  private runSeed = 0;
   private stairsX = 0;
   private stairsY = 0;
 
@@ -66,6 +67,25 @@ export class Game {
   private afterimageLs = 0;
   private lavaTickTimer = 0;
 
+  // Floor transition
+  private transitionTimer = 0;
+  private transitionFloor = 0;
+  private transitionMessage = '';
+
+  // Healing zones (Spore Burst evolution)
+  healingZones: { x: number; y: number; radius: number; timer: number; healPerTick: number; tickTimer: number }[] = [];
+
+  // Shop state
+  private shopOpen = false;
+  private shopInventory: { type: 'mineral' | 'health'; mineral?: import('./types').MineralData; healAmount?: number; hpCost: number; purchased: boolean }[] = [];
+  private shopRoomCenter: Point | null = null;
+
+  // Secret room caches — special reward interactables
+  private secretCaches: { x: number; y: number; claimed: boolean }[] = [];
+
+  // Track melee kills for Iron Frenzy evolution
+  private lastKillWasMelee = false;
+
   // Run tracking for progression
   runKills = 0;
   runBossKills = 0;
@@ -82,6 +102,7 @@ export class Game {
 
   init(): void {
     this.floor = 1;
+    this.runSeed = (Math.random() * 2147483647) | 0;
     this.comboCount = 0;
     this.comboTimer = 0;
     this.runKills = 0;
@@ -92,7 +113,7 @@ export class Game {
   }
 
   private initFloor(isNewGame: boolean): void {
-    const { map, rooms } = generateDungeon(this.floor);
+    const { map, rooms } = generateDungeon(this.floor, this.runSeed);
     this.map = map;
     this.rooms = rooms;
     this.projectiles = [];
@@ -109,10 +130,24 @@ export class Game {
     this.lavaTickTimer = 0;
     if (isNewGame) this.keys = 0;
 
-    const lastRoom = this.rooms[this.rooms.length - 1];
-    this.stairsX = Math.floor(lastRoom.x + lastRoom.width / 2);
-    this.stairsY = Math.floor(lastRoom.y + lastRoom.height / 2);
+    // Place stairs in the last non-secret room (secret rooms should never have stairs)
+    const nonSecretRooms = this.rooms.filter(r => r.roomType !== RoomType.Secret);
+    const stairsRoom = nonSecretRooms[nonSecretRooms.length - 1] ?? this.rooms[0];
+    this.stairsX = Math.floor(stairsRoom.x + stairsRoom.width / 2);
+    this.stairsY = Math.floor(stairsRoom.y + stairsRoom.height / 2);
     this.map[this.stairsY][this.stairsX] = TileType.Stairs;
+
+    // Place substrate caches in secret rooms
+    this.secretCaches = [];
+    for (const room of this.rooms) {
+      if (room.roomType === RoomType.Secret) {
+        this.secretCaches.push({
+          x: Math.floor(room.x + room.width / 2),
+          y: Math.floor(room.y + room.height / 2),
+          claimed: false,
+        });
+      }
+    }
 
     const startRoom = this.rooms[0];
     const px = Math.floor(startRoom.x + startRoom.width / 2);
@@ -142,6 +177,24 @@ export class Game {
       // Load discovered evolutions
       this.player.discoveredEvolutions = new Set(this.progress.discoveredEvolutions);
 
+      // Tenacity upgrade: +1 base tendril damage per level
+      const tenacityLvl = getUpgradeLevel(this.progress, 'tenacity');
+      if (tenacityLvl > 0) {
+        this.player.tendrilBaseDamage = 5 + tenacityLvl;
+      }
+
+      // Quick Adaptation upgrade: -10s mutation decay per level
+      const adaptLvl = getUpgradeLevel(this.progress, 'adaptation');
+      if (adaptLvl > 0) {
+        this.player.mutationDecayBonus = adaptLvl * 10;
+      }
+
+      // Mineral Affinity upgrade: +5% rarity chance per level
+      const affinityLvl = getUpgradeLevel(this.progress, 'affinity');
+      if (affinityLvl > 0) {
+        this.player.rarityBonus = affinityLvl * 0.05;
+      }
+
       // Starting mutation upgrade
       const startMutLvl = getUpgradeLevel(this.progress, 'startmut');
       if (startMutLvl > 0) {
@@ -166,6 +219,15 @@ export class Game {
     this.player.onWallPlace = (tiles, dur, effect) => this.handleWallPlace(tiles, dur, effect);
     this.player.onBeamFire = (x, y, ddx, ddy, effect, color) => this.handleBeamFire(x, y, ddx, ddy, effect, color);
     this.player.onSummon = (x, y, effect, color) => this.handleSummon(x, y, effect, color);
+    this.player.onTeleport = () => {
+      // Void Step evolution: teleport grants 1s invincibility
+      const hasVoidStep = this.player.synergies.evolutions.some(e => e.recipe.id === 'void_step');
+      if (hasVoidStep) {
+        this.player.shieldTimer = 1.0;
+        addFloatingText(this.player.px, this.player.py - TILE_SIZE * 1.5, 'VOID STEP!', '#cc55ff', 1.0);
+        addRing(this.player.px, this.player.py, TILE_SIZE * 2, '#cc55ff', 0.4);
+      }
+    };
     this.player.onMutationDecay = (slot) => this.handleMutationDecay(slot);
     this.player.onCoreMutation = (elem) => {
       addFloatingText(this.player.px, this.player.py - TILE_SIZE * 1.5, `CORE: ${ELEMENT_NAMES[elem]}!`, ELEMENT_COLORS[elem], 2.0);
@@ -177,7 +239,7 @@ export class Game {
       addTrail(this.player.px, this.player.py, colors[se.type] || '#ffffff');
     };
 
-    this.minerals = spawnMinerals(this.rooms, this.map, this.floor);
+    this.minerals = spawnMinerals(this.rooms, this.map, this.floor, this.player.rarityBonus);
     this.healthPickups = spawnHealthPickups(this.rooms, this.map, this.floor);
 
     // Boss floors: every 3rd floor
@@ -201,13 +263,64 @@ export class Game {
       boss.onShoot = (p) => this.projectiles.push(p);
       boss.onBossSlam = () => this.handleBossSlam(boss);
       boss.onBossSummon = () => this.handleBossSummon(boss);
+      boss.onMeleeHit = (dmg) => {
+        addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `-${dmg}`, '#ff6666');
+      };
+      // Boss-type-specific callbacks
+      boss.onPoisonTrail = () => {
+        this.poisonClouds.push({ x: boss.px, y: boss.py, damage: 3 + this.floor, timer: 5.0, radius: TILE_SIZE * 2 });
+      };
+      boss.onBossTeleport = () => {
+        for (let attempt = 0; attempt < 20; attempt++) {
+          const nx = boss.x + Math.floor(Math.random() * 12) - 6;
+          const ny = boss.y + Math.floor(Math.random() * 12) - 6;
+          if (nx >= 0 && nx < MAP_WIDTH && ny >= 0 && ny < MAP_HEIGHT && this.map[ny][nx] !== TileType.Wall) {
+            addRing(boss.px, boss.py, TILE_SIZE * 2, '#cc55ff', 0.3);
+            boss.x = nx; boss.y = ny; boss.tx = nx; boss.ty = ny;
+            boss.px = nx * TILE_SIZE + TILE_SIZE / 2;
+            boss.py = ny * TILE_SIZE + TILE_SIZE / 2;
+            addFlash(boss.px, boss.py, TILE_SIZE * 2, '#cc55ff', 0.2);
+            // Mercury Phantom applies slow on teleport
+            const dist = Math.abs(boss.x - this.player.x) + Math.abs(boss.y - this.player.y);
+            if (dist <= 3) {
+              this.player.applyStatusEffect({ type: StatusType.Slow, duration: 2, tickTimer: 0, tickDamage: 0, slowFactor: 0.5 });
+            }
+            break;
+          }
+        }
+      };
       this.enemies.push(boss);
       this.bossAlive = true;
     }
 
     for (const enemy of this.enemies) {
       if (!enemy.onShoot) enemy.onShoot = (p) => this.projectiles.push(p);
+      enemy.onMeleeHit = (dmg) => {
+        addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `-${dmg}`, '#ff6666');
+      };
     }
+
+    // Shop room setup
+    const shopRoom = this.rooms.find(r => r.roomType === RoomType.Shop);
+    if (shopRoom) {
+      this.shopRoomCenter = {
+        x: Math.floor(shopRoom.x + shopRoom.width / 2),
+        y: Math.floor(shopRoom.y + shopRoom.height / 2),
+      };
+      this.shopInventory = [];
+      for (let i = 0; i < 3; i++) {
+        const mineral = generateMineral(this.floor);
+        mineral.rarity = Math.max(1, mineral.rarity) as typeof mineral.rarity;
+        const hpCost = 10 + mineral.rarity * 10;
+        this.shopInventory.push({ type: 'mineral', mineral, hpCost, purchased: false });
+      }
+      this.shopInventory.push({ type: 'health', healAmount: 30 + this.floor * 5, hpCost: 15, purchased: false });
+    } else {
+      this.shopRoomCenter = null;
+      this.shopInventory = [];
+    }
+    this.shopOpen = false;
+    this.healingZones = [];
 
     this.camera.follow(
       this.player.px, this.player.py,
@@ -229,9 +342,21 @@ export class Game {
 
   private descend(): void {
     this.floor++;
-    addFloatingText(this.player.px, this.player.py - TILE_SIZE * 1.5, `FLOOR ${this.floor}`, '#e0a030', 2.0);
+    this.transitionFloor = this.floor;
+    this.transitionMessage = this.getFloorMessage(this.floor);
+    this.transitionTimer = 1.5;
     this.camera.shake(4, 0.3);
     this.initFloor(false);
+  }
+
+  private getFloorMessage(floor: number): string {
+    if (floor % 3 === 0) return 'A guardian awaits...';
+    if (floor >= 4 && floor % 2 === 0) return 'A merchant sets up shop';
+    const cycle = ((floor - 1) % 12);
+    if (cycle < 2) return 'Clean excavation tunnels...';
+    if (cycle < 5) return 'Fungal growth covers the walls...';
+    if (cycle < 8) return 'Crystal formations shimmer...';
+    return 'Heat rises from below...';
   }
 
   private get comboMult(): number {
@@ -255,6 +380,12 @@ export class Game {
   };
 
   private update(dt: number): void {
+    // Floor transition overlay
+    if (this.transitionTimer > 0) {
+      this.transitionTimer -= dt;
+      return;
+    }
+
     if (this.player.dead) {
       if (wasKeyPressed('KeyR')) this.init();
       // Upgrade purchases via number keys on death screen
@@ -330,6 +461,16 @@ export class Game {
             this.camera.shake(3, 0.2);
           }
         }
+        // Cracked wall — break with melee attack (E key)
+        if (this.map[frontY][frontX] === TileType.CrackedWall) {
+          if (wasKeyPressed('KeyE')) {
+            this.map[frontY][frontX] = TileType.Corridor;
+            addFloatingText(frontX * TILE_SIZE + TILE_SIZE / 2, frontY * TILE_SIZE, 'CRUMBLE!', '#8888aa', 1.0);
+            addRing(frontX * TILE_SIZE + TILE_SIZE / 2, frontY * TILE_SIZE + TILE_SIZE / 2, TILE_SIZE * 2, '#6666aa', 0.4);
+            addFlash(frontX * TILE_SIZE + TILE_SIZE / 2, frontY * TILE_SIZE + TILE_SIZE / 2, TILE_SIZE, '#aaaacc', 0.15);
+            this.camera.shake(4, 0.25);
+          }
+        }
       }
     }
 
@@ -352,7 +493,7 @@ export class Game {
           { type: BuffType.SpeedUp, mag: 0.25, dur: 45, name: 'SPEED UP' },
           { type: BuffType.Regen, mag: 2, dur: 30, name: 'REGEN' },
           { type: BuffType.CooldownDown, mag: 0.3, dur: 45, name: 'QUICK CAST' },
-          { type: BuffType.Shield, mag: 30, dur: 999, name: 'FORTIFY' },
+          { type: BuffType.Shield, mag: 30, dur: 99999, name: 'FORTIFY' },
         ];
         const chosen = buffs[Math.floor(Math.random() * buffs.length)];
         this.activeBuffs.push({ type: chosen.type, duration: chosen.dur, magnitude: chosen.mag });
@@ -364,6 +505,52 @@ export class Game {
         addFloatingText(this.player.px, this.player.py - TILE_SIZE * 2, chosen.name, '#cc88ff', 2.0);
         addRing(this.player.px, this.player.py, TILE_SIZE * 3, '#cc88ff', 0.6);
         this.camera.shake(4, 0.3);
+      }
+    }
+
+    // Secret cache interaction — substrate cache in hidden rooms
+    for (const cache of this.secretCaches) {
+      if (cache.claimed) continue;
+      if (this.player.x === cache.x && this.player.y === cache.y && wasKeyPressed('Space')) {
+        cache.claimed = true;
+
+        // 1. Spawn a guaranteed rare/legendary mineral on the ground nearby
+        const bonusMineral = generateMineral(this.floor + 5); // scaled way above current floor
+        bonusMineral.rarity = Math.random() < 0.4 ? 3 : 2; // 40% legendary, 60% rare
+        const rarityName = bonusMineral.rarity === 3 ? 'LEGENDARY' : 'RARE';
+        const rarityColor = bonusMineral.rarity === 3 ? '#ff8800' : '#aa66ff';
+        // Place mineral adjacent to cache so it doesn't overlap the player
+        let mx = cache.x + 1, my = cache.y;
+        if (this.map[my]?.[mx] === TileType.Wall) { mx = cache.x - 1; my = cache.y; }
+        if (this.map[my]?.[mx] === TileType.Wall) { mx = cache.x; my = cache.y + 1; }
+        if (this.map[my]?.[mx] === TileType.Wall) { mx = cache.x; my = cache.y - 1; }
+        this.minerals.push(new Mineral(mx, my, bonusMineral));
+
+        // 2. Bonus substrate points (meta-progression currency)
+        const bonusPoints = 10 + this.floor * 3;
+        this.progress.substratePoints += bonusPoints;
+        saveProgress(this.progress);
+
+        // 3. Small permanent max HP boost
+        const hpBonus = 5 + Math.floor(this.floor / 3) * 2;
+        this.player.baseMaxHp += hpBonus;
+        this.player.maxHp += hpBonus;
+        this.player.hp = Math.min(this.player.hp + hpBonus, this.player.maxHp);
+
+        // 4. Full heal
+        this.player.hp = this.player.maxHp;
+
+        // VFX cascade
+        const cpx = cache.x * TILE_SIZE + TILE_SIZE / 2;
+        const cpy = cache.y * TILE_SIZE + TILE_SIZE / 2;
+        addFloatingText(cpx, cpy - TILE_SIZE * 3, 'SUBSTRATE CACHE', '#00ffb4', 2.5);
+        addFloatingText(cpx, cpy - TILE_SIZE * 2, `${rarityName} MINERAL`, rarityColor, 2.0);
+        addFloatingText(cpx, cpy - TILE_SIZE, `+${bonusPoints} SUBSTRATE`, '#00ddff', 1.8);
+        addFloatingText(cpx, cpy, `+${hpBonus} MAX HP  ❤ FULL HEAL`, '#88ff88', 1.6);
+        addRing(cpx, cpy, TILE_SIZE * 4, '#00ffb4', 0.8);
+        addRing(cpx, cpy, TILE_SIZE * 2.5, '#00ddff', 0.5);
+        addFlash(cpx, cpy, TILE_SIZE * 6, '#00ffb4', 0.4);
+        this.camera.shake(6, 0.5);
       }
     }
 
@@ -423,7 +610,7 @@ export class Game {
           const tx = Math.floor(bx / TILE_SIZE);
           const ty = Math.floor(by / TILE_SIZE);
           if (tx < 0 || tx >= MAP_WIDTH || ty < 0 || ty >= MAP_HEIGHT) break;
-          if (this.map[ty][tx] === TileType.Wall || this.map[ty][tx] === TileType.LockedDoor) break;
+          if (this.map[ty][tx] === TileType.Wall || this.map[ty][tx] === TileType.LockedDoor || this.map[ty][tx] === TileType.CrackedWall) break;
           for (const enemy of this.enemies) {
             if (enemy.dead) continue;
             const edx = enemy.px - bx;
@@ -433,7 +620,7 @@ export class Game {
               enemy.takeDamage(finalDmg);
               addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, '#ff4444', 0.3);
               if (beam.lifesteal > 0) this.player.heal(Math.round(finalDmg * beam.lifesteal));
-              if (beam.statusEffect) enemy.applyStatusEffect(beam.statusEffect);
+              if (beam.statusEffect) this.applyBoostedStatus(enemy, beam.statusEffect);
               if (enemy.dead) this.onEnemyDeath(enemy);
             }
           }
@@ -455,7 +642,7 @@ export class Game {
         const cdx = enemy.px - cloud.x;
         const cdy = enemy.py - cloud.y;
         if (cdx * cdx + cdy * cdy < cloud.radius * cloud.radius) {
-          enemy.applyStatusEffect({ type: StatusType.Poison, duration: 2, tickTimer: STATUS_TICK_INTERVAL, tickDamage: cloud.damage, slowFactor: 1 });
+          this.applyBoostedStatus(enemy, { type: StatusType.Poison, duration: 2, tickTimer: STATUS_TICK_INTERVAL, tickDamage: cloud.damage, slowFactor: 1 });
         }
       }
     }
@@ -470,7 +657,7 @@ export class Game {
         attacked.takeDamage(finalDmg);
         addFloatingText(attacked.px, attacked.py - TILE_SIZE * 0.5, `-${finalDmg}`, '#44ffaa', 0.5);
         addFlash(attacked.px, attacked.py, TILE_SIZE * 0.3, ally.color);
-        if (ally.statusEffect) attacked.applyStatusEffect(ally.statusEffect);
+        if (ally.statusEffect) this.applyBoostedStatus(attacked, ally.statusEffect);
         if (attacked.dead) this.onEnemyDeath(attacked);
       }
       if (ally.dead) {
@@ -502,11 +689,11 @@ export class Game {
       }
     }
 
-    // Berserker passive check
+    // Berserker passive — bonus damage and cooldown reduction at low HP
     const hasBerserker = this.player.synergies.evolutions.some(e => e.recipe.id === 'berserker');
     if (hasBerserker && this.player.hp <= this.player.maxHp * 0.3) {
       this.player.synergies.damageMult += 0.8;
-      this.player.synergies.cooldownMult -= 0.4;
+      this.player.synergies.cooldownMult = Math.max(0.1, this.player.synergies.cooldownMult - 0.4);
     }
 
     // Evolution discovery VFX
@@ -551,6 +738,55 @@ export class Game {
       }
     }
 
+    // Update healing zones (Spore Burst evolution)
+    for (let i = this.healingZones.length - 1; i >= 0; i--) {
+      const zone = this.healingZones[i];
+      zone.timer -= dt;
+      if (zone.timer <= 0) { this.healingZones.splice(i, 1); continue; }
+      zone.tickTimer -= dt;
+      if (zone.tickTimer <= 0) {
+        zone.tickTimer = 0.5;
+        const dx = this.player.px - zone.x;
+        const dy = this.player.py - zone.y;
+        if (dx * dx + dy * dy <= zone.radius * zone.radius) {
+          this.player.heal(zone.healPerTick);
+          addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `+${zone.healPerTick}`, '#33ff99', 0.3);
+        }
+      }
+    }
+
+    // Shop interaction
+    if (this.shopRoomCenter && this.player.x === this.shopRoomCenter.x && this.player.y === this.shopRoomCenter.y) {
+      if (!this.shopOpen && wasKeyPressed('Space')) {
+        this.shopOpen = true;
+      }
+    }
+    if (this.shopOpen) {
+      for (let i = 0; i < this.shopInventory.length; i++) {
+        if (wasKeyPressed(`Digit${i + 1}`)) {
+          const item = this.shopInventory[i];
+          if (!item.purchased && this.player.hp > item.hpCost) {
+            item.purchased = true;
+            this.player.hp -= item.hpCost;
+            this.player.flashTimer = 0.1;
+            if (item.type === 'mineral' && item.mineral) {
+              if (!this.player.consumeMineral(item.mineral)) {
+                this.minerals.push(new Mineral(this.player.x, this.player.y, item.mineral));
+              }
+              addFloatingText(this.player.px, this.player.py - TILE_SIZE, 'PURCHASED!', '#ffcc00', 1.0);
+            } else if (item.type === 'health' && item.healAmount) {
+              this.player.heal(item.healAmount);
+              addFloatingText(this.player.px, this.player.py - TILE_SIZE, `+${item.healAmount} HP`, '#44ff44', 1.0);
+            }
+            this.camera.shake(2, 0.1);
+          }
+        }
+      }
+      if (wasKeyPressed('Escape') || (wasKeyPressed('Space') && !(this.shopRoomCenter && this.player.x === this.shopRoomCenter.x && this.player.y === this.shopRoomCenter.y))) {
+        this.shopOpen = false;
+      }
+    }
+
     // Health pickup auto-collection
     for (const pickup of this.healthPickups) {
       if (pickup.consumed) continue;
@@ -592,9 +828,33 @@ export class Game {
       }
     }
 
+    // Quantum Shield: reflect enemy projectiles off temporary walls
+    const hasQuantumShield = this.player.synergies.evolutions.some(e => e.recipe.id === 'quantum_shield');
+
     const dmgMult = this.player.synergies.damageMult * this.comboMult;
     for (const proj of this.projectiles) {
+      const prevX = proj.x;
+      const prevY = proj.y;
       proj.update(dt, this.map);
+
+      // Quantum Shield: reflect enemy projectiles on temporary wall collision
+      if (proj.dead && !proj.fromPlayer && hasQuantumShield) {
+        const hitTileX = Math.floor(proj.x / TILE_SIZE);
+        const hitTileY = Math.floor(proj.y / TILE_SIZE);
+        const isTemporaryWall = this.temporaryWalls.some(w => w.x === hitTileX && w.y === hitTileY);
+        if (isTemporaryWall) {
+          proj.dead = false;
+          proj.dx = -proj.dx;
+          proj.dy = -proj.dy;
+          proj.fromPlayer = true;
+          proj.x = prevX;
+          proj.y = prevY;
+          proj.lifetime = 1.0;
+          proj.color = '#00eedd';
+          addFlash(proj.x, proj.y, TILE_SIZE * 0.5, '#00eedd', 0.15);
+        }
+      }
+
       if (proj.dead) continue;
 
       if (proj.fromPlayer) {
@@ -603,9 +863,14 @@ export class Game {
           const dx = proj.x - enemy.px;
           const dy = proj.y - enemy.py;
           if (dx * dx + dy * dy < (TILE_SIZE * 0.5) ** 2) {
-            const finalDmg = Math.round(proj.damage * dmgMult);
+            // Magnetic Pull: 20% more damage to nearby enemies
+            let magneticMult = 1;
+            const hasMagneticPull = this.player.synergies.evolutions.some(e => e.recipe.id === 'magnetic_pull');
+            if (hasMagneticPull && Math.abs(enemy.x - this.player.x) + Math.abs(enemy.y - this.player.y) <= 2) magneticMult = 1.2;
+            const finalDmg = Math.round(proj.damage * dmgMult * magneticMult);
             enemy.takeDamage(finalDmg);
-            addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, '#ff4444');
+            const dmgColor = finalDmg >= 30 ? '#ffcc00' : '#ff4444';
+            addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, dmgColor);
             addFlash(enemy.px, enemy.py, TILE_SIZE * 0.3, '#ffffff');
             this.camera.shake(2, 0.1);
             const totalLs = proj.lifesteal + this.player.synergies.lifestealBonus;
@@ -614,8 +879,10 @@ export class Game {
               this.player.heal(healed);
               addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `+${healed}`, '#44ff44');
             }
-            // Apply status effect from projectile
-            if (proj.statusEffect) {
+            // Apply synergy-boosted status effect from projectile
+            if (proj.statusEffect && proj.fromPlayer) {
+              this.applyBoostedStatus(enemy, proj.statusEffect);
+            } else if (proj.statusEffect) {
               enemy.applyStatusEffect(proj.statusEffect);
             }
             if (!proj.pierce) proj.dead = true;
@@ -665,6 +932,24 @@ export class Game {
                 timer: 3.0,
                 radius: TILE_SIZE * 1.5,
               });
+            }
+            // Acid Rain evolution: split into 3 on impact
+            if (proj.dead) {
+              const hasAcidRain = this.player.synergies.evolutions.some(e => e.recipe.id === 'acid_rain');
+              if (hasAcidRain && !proj.isSplit) {
+                for (let s = 0; s < 3; s++) {
+                  const angle = (s / 3) * Math.PI * 2;
+                  const splitProj = new Projectile(proj.x, proj.y, Math.cos(angle), Math.sin(angle), {
+                    speed: proj.speed * 0.8,
+                    damage: Math.round(proj.damage * 0.4),
+                    lifetime: 0.5,
+                    color: '#cccc00',
+                    fromPlayer: true,
+                  });
+                  splitProj.isSplit = true;
+                  this.projectiles.push(splitProj);
+                }
+              }
             }
             if (enemy.dead) this.onEnemyDeath(enemy);
           }
@@ -810,21 +1095,89 @@ export class Game {
     }
   }
 
+  /** Apply synergy-boosted status effects to enemies (Thermite/Catalyst bonuses) */
+  private applyBoostedStatus(enemy: Enemy, effect: StatusEffect): void {
+    const boosted = { ...effect };
+    boosted.duration *= this.player.synergies.statusDurationMult;
+    if (boosted.type === StatusType.Burn) {
+      boosted.tickDamage = Math.round(boosted.tickDamage * this.player.synergies.burnDamageMult);
+    }
+    enemy.applyStatusEffect(boosted);
+  }
+
   private handleTendrilAttack(): void {
     const { dx, dy } = facingToDelta(this.player.facing);
-    const ax = this.player.x + dx;
-    const ay = this.player.y + dy;
-    addFlash(this.player.px + dx * TILE_SIZE, this.player.py + dy * TILE_SIZE, TILE_SIZE * 0.5, '#ffffff', 0.1);
+
+    // --- Cone parameters (match the VFX exactly) ---
+    const sweepAngle = Math.atan2(dy, dx);
+    const sweepArc = Math.PI * 0.8;           // 144° cone
+    const sweepRange = TILE_SIZE * 2.5;        // pixel radius of the cone
+    const halfArc = sweepArc / 2;
+
+    // --- Sweep VFX ---
+    addSweep(this.player.px, this.player.py, sweepRange, sweepAngle, sweepArc, '#e2e2e2', 0.2);
+    this.camera.shake(3, 0.1);
+
+    // --- Floor-scaling damage ---
+    const floorScale = 1 + this.floor * 0.2;
     const dmgMult = this.player.synergies.damageMult * this.comboMult;
+    const baseDmg = this.player.tendrilBaseDamage * floorScale;
+    const lifestealPct = 0.1 + this.player.synergies.lifestealBonus; // 10% innate + synergy bonus
+
+    let totalDamageDealt = 0;
+
     for (const enemy of this.enemies) {
       if (enemy.dead) continue;
-      if (enemy.x === ax && enemy.y === ay) {
-        const finalDmg = Math.round(5 * dmgMult);
-        enemy.takeDamage(finalDmg);
-        addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, '#ff4444');
-        addFlash(enemy.px, enemy.py, TILE_SIZE * 0.3, '#ffffff');
-        this.camera.shake(2, 0.08);
-        if (enemy.dead) this.onEnemyDeath(enemy);
+
+      // --- Distance + angle cone check (matches visual arc) ---
+      const edx = enemy.px - this.player.px;
+      const edy = enemy.py - this.player.py;
+      const dist = Math.sqrt(edx * edx + edy * edy);
+      if (dist > sweepRange || dist < 1) continue;
+
+      let angleToEnemy = Math.atan2(edy, edx) - sweepAngle;
+      // Normalize to [-PI, PI]
+      while (angleToEnemy > Math.PI) angleToEnemy -= Math.PI * 2;
+      while (angleToEnemy < -Math.PI) angleToEnemy += Math.PI * 2;
+      if (Math.abs(angleToEnemy) > halfArc) continue;
+
+      const finalDmg = Math.round(baseDmg * dmgMult);
+      enemy.takeDamage(finalDmg);
+      totalDamageDealt += finalDmg;
+      const tdmgColor = finalDmg >= 20 ? '#ffcc00' : '#ff4444';
+      addFloatingText(enemy.px, enemy.py - TILE_SIZE * 0.5, `-${finalDmg}`, tdmgColor);
+      addFlash(enemy.px, enemy.py, TILE_SIZE * 0.4, '#ffffff');
+
+      // --- Knockback: push enemy 1 tile in facing direction ---
+      if (!enemy.dead) {
+        const kbx = enemy.x + dx;
+        const kby = enemy.y + dy;
+        if (kbx >= 0 && kbx < MAP_WIDTH && kby >= 0 && kby < MAP_HEIGHT) {
+          const tile = this.map[kby][kbx];
+          if (tile !== TileType.Wall && tile !== TileType.CrackedWall && tile !== TileType.LockedDoor && tile !== TileType.Lava) {
+            const blocked = this.enemies.some(e => !e.dead && e !== enemy && e.x === kbx && e.y === kby);
+            if (!blocked) {
+              enemy.x = kbx;
+              enemy.y = kby;
+              enemy.tx = kbx;
+              enemy.ty = kby;
+              enemy.px = kbx * TILE_SIZE + TILE_SIZE / 2;
+              enemy.py = kby * TILE_SIZE + TILE_SIZE / 2;
+              addTrail(enemy.px, enemy.py, '#aaaacc', 0.15);
+            }
+          }
+        }
+      }
+
+      if (enemy.dead) { this.lastKillWasMelee = true; this.onEnemyDeath(enemy); this.lastKillWasMelee = false; }
+    }
+
+    // --- Innate lifesteal ---
+    if (totalDamageDealt > 0 && lifestealPct > 0) {
+      const healed = Math.round(totalDamageDealt * lifestealPct);
+      if (healed > 0) {
+        this.player.heal(healed);
+        addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `+${healed}`, '#44ff88');
       }
     }
   }
@@ -857,6 +1210,11 @@ export class Game {
       this.afterimageLs = lifesteal;
       addTrail(this.player.px, this.player.py, '#e050ff');
     }
+    // Supernova evolution: dash ends with massive explosion
+    const hasSupernova = this.player.synergies.evolutions.some(e => e.recipe.id === 'supernova');
+    if (hasSupernova) {
+      this.handleExplosion(this.player.px, this.player.py, TILE_SIZE * 4, damage * 2, lifesteal);
+    }
   }
 
   private handleAoePulse(damage: number, radius: number, lifesteal: number, effect?: AbilityEffect): void {
@@ -876,10 +1234,22 @@ export class Game {
         let totalLs = lifesteal + this.player.synergies.lifestealBonus;
         if (effect?.healsOnHit) totalLs += 0.25; // Life Engine: +25% healing
         if (totalLs > 0) {
-          this.player.heal(Math.round(finalDmg * totalLs));
+          const healed = Math.round(finalDmg * totalLs);
+          this.player.heal(healed);
+          addFloatingText(this.player.px, this.player.py - TILE_SIZE * 0.5, `+${healed}`, '#44ff44');
         }
         if (enemy.dead) this.onEnemyDeath(enemy);
       }
+    }
+    // Spore Burst evolution: AoE leaves healing zone
+    const hasSporeBurst = this.player.synergies.evolutions.some(e => e.recipe.id === 'spore_burst');
+    if (hasSporeBurst) {
+      this.healingZones.push({
+        x: this.player.px, y: this.player.py,
+        radius: radius * 0.8,
+        timer: 4.0, healPerTick: 3, tickTimer: 0,
+      });
+      addFloatingText(this.player.px, this.player.py - TILE_SIZE * 1.5, 'HEALING ZONE!', '#33ff99', 1.0);
     }
   }
 
@@ -952,6 +1322,29 @@ export class Game {
     }
     addFloatingText(this.player.px, this.player.py - TILE_SIZE, 'WALL!', '#00eedd', 0.6);
     addFlash(this.player.px + TILE_SIZE, this.player.py, TILE_SIZE * 2, '#00eedd', 0.2);
+
+    // Swarm Matrix evolution: walls spawn mini allies
+    const hasSwarmMatrix = this.player.synergies.evolutions.some(e => e.recipe.id === 'swarm_matrix');
+    if (hasSwarmMatrix) {
+      for (const t of tiles) {
+        // Spawn ally adjacent to each wall tile
+        const dirs: [number, number][] = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        for (const [ddx, ddy] of dirs) {
+          const ax = t.x + ddx;
+          const ay = t.y + ddy;
+          if (ax >= 0 && ax < MAP_WIDTH && ay >= 0 && ay < MAP_HEIGHT) {
+            const tile = this.map[ay][ax];
+            if (tile !== TileType.Wall && tile !== TileType.LockedDoor) {
+              const ally = new Ally(ax, ay, 8 + this.floor * 2, duration, '#00eedd', 0, null);
+              this.allies.push(ally);
+              addRing(ax * TILE_SIZE + TILE_SIZE / 2, ay * TILE_SIZE + TILE_SIZE / 2, TILE_SIZE, '#00eedd', 0.3);
+              break; // One ally per wall tile
+            }
+          }
+        }
+      }
+      addFloatingText(this.player.px, this.player.py - TILE_SIZE * 1.5, 'SWARM!', '#00eedd', 1.0);
+    }
   }
 
   private handleBeamFire(x: number, y: number, ddx: number, ddy: number, effect: AbilityEffect, color: string): void {
@@ -997,7 +1390,7 @@ export class Game {
       addFloatingText(this.player.px, this.player.py - TILE_SIZE * 1.5,
         `${this.comboCount}x COMBO!`, '#ffcc00', 1.0);
       this.camera.shake(4, 0.2);
-      this.player.heal(3 * this.comboCount);
+      this.player.heal(Math.round((3 + this.floor) * this.comboCount));
     }
 
     // Boss death
@@ -1020,7 +1413,25 @@ export class Game {
       return;
     }
 
-    addFloatingText(enemy.px, enemy.py - TILE_SIZE, 'KILLED!', '#ffcc00', 0.8);
+    // Iron Frenzy: melee kills reset all ability cooldowns
+    const hasIronFrenzy = this.player.synergies.evolutions.some(e => e.recipe.id === 'iron_frenzy');
+    if (hasIronFrenzy && this.lastKillWasMelee) {
+      for (const ability of this.player.abilities) {
+        if (ability) ability.cooldown = 0;
+      }
+      addFloatingText(this.player.px, this.player.py - TILE_SIZE * 2, 'FRENZY!', '#4466ff', 1.0);
+    }
+
+    // Elite death
+    if (enemy.isElite) {
+      addFloatingText(enemy.px, enemy.py - TILE_SIZE * 1.5, 'ELITE SLAIN!', '#ffcc44', 2.0);
+      addRing(enemy.px, enemy.py, TILE_SIZE * 2.5, '#ffcc44', 0.5);
+      const eliteDrop = generateMineral(this.floor);
+      eliteDrop.rarity = Math.max(1, eliteDrop.rarity) as typeof eliteDrop.rarity;
+      this.minerals.push(new Mineral(enemy.x, enemy.y, eliteDrop));
+    } else {
+      addFloatingText(enemy.px, enemy.py - TILE_SIZE, 'KILLED!', '#ffcc00', 0.8);
+    }
     addRing(enemy.px, enemy.py, TILE_SIZE * 1.5, '#ffcc00', 0.3);
     this.camera.shake(3, 0.15);
 
@@ -1074,6 +1485,110 @@ export class Game {
       }
     }
 
+    // Render secret substrate caches
+    for (const cache of this.secretCaches) {
+      if (cache.claimed) continue;
+      const sx = cache.x * TILE_SIZE + TILE_SIZE / 2 - this.camera.x;
+      const sy = cache.y * TILE_SIZE + TILE_SIZE / 2 - this.camera.y;
+      const dist = Math.sqrt((cache.x - this.player.x) ** 2 + (cache.y - this.player.y) ** 2);
+      if (dist > VISION_RADIUS) continue;
+
+      // Pulsing outer glow
+      const pulse = 0.4 + Math.sin(this.gameTime * 2.5) * 0.2;
+      const grad = this.ctx.createRadialGradient(sx, sy, 0, sx, sy, TILE_SIZE * 1.2);
+      grad.addColorStop(0, `rgba(0,255,180,${pulse * 0.6})`);
+      grad.addColorStop(0.6, `rgba(0,200,255,${pulse * 0.3})`);
+      grad.addColorStop(1, 'rgba(0,255,180,0)');
+      this.ctx.beginPath();
+      this.ctx.arc(sx, sy, TILE_SIZE * 1.2, 0, Math.PI * 2);
+      this.ctx.fillStyle = grad;
+      this.ctx.fill();
+
+      // Crystal shape (hexagonal)
+      const sz = 5 + Math.sin(this.gameTime * 3) * 1;
+      this.ctx.beginPath();
+      for (let i = 0; i < 6; i++) {
+        const angle = (Math.PI / 3) * i - Math.PI / 6;
+        const px = sx + Math.cos(angle) * sz;
+        const py = sy + Math.sin(angle) * sz;
+        if (i === 0) this.ctx.moveTo(px, py);
+        else this.ctx.lineTo(px, py);
+      }
+      this.ctx.closePath();
+      this.ctx.fillStyle = '#00ffb4';
+      this.ctx.fill();
+      this.ctx.strokeStyle = '#00ddff';
+      this.ctx.lineWidth = 1.5;
+      this.ctx.stroke();
+
+      // Inner sparkle
+      const sparkle = 0.6 + Math.sin(this.gameTime * 5) * 0.4;
+      this.ctx.beginPath();
+      this.ctx.arc(sx, sy, 2, 0, Math.PI * 2);
+      this.ctx.fillStyle = `rgba(255,255,255,${sparkle})`;
+      this.ctx.fill();
+
+      // Label
+      this.ctx.fillStyle = '#00ffb4';
+      this.ctx.font = 'bold 6px monospace';
+      this.ctx.textAlign = 'center';
+      this.ctx.fillText('CACHE', sx, sy - sz - 5);
+      if (this.player.x === cache.x && this.player.y === cache.y) {
+        this.ctx.fillStyle = '#00ddff';
+        this.ctx.font = '7px monospace';
+        this.ctx.fillText('[SPACE] Open', sx, sy + sz + 9);
+      }
+      this.ctx.textAlign = 'start';
+    }
+
+    // Render shop NPC
+    if (this.shopRoomCenter) {
+      const sx = this.shopRoomCenter.x * TILE_SIZE + TILE_SIZE / 2 - this.camera.x;
+      const sy = this.shopRoomCenter.y * TILE_SIZE + TILE_SIZE / 2 - this.camera.y;
+      const shopDist = Math.sqrt((this.shopRoomCenter.x - this.player.x) ** 2 + (this.shopRoomCenter.y - this.player.y) ** 2);
+      if (shopDist <= VISION_RADIUS) {
+        // Gold diamond
+        const sz = 7;
+        this.ctx.beginPath();
+        this.ctx.moveTo(sx, sy - sz);
+        this.ctx.lineTo(sx + sz, sy);
+        this.ctx.lineTo(sx, sy + sz);
+        this.ctx.lineTo(sx - sz, sy);
+        this.ctx.closePath();
+        this.ctx.fillStyle = '#e0a030';
+        this.ctx.fill();
+        this.ctx.strokeStyle = '#ffcc00';
+        this.ctx.lineWidth = 1.5;
+        this.ctx.stroke();
+        // Label
+        this.ctx.fillStyle = '#ffcc00';
+        this.ctx.font = 'bold 7px monospace';
+        this.ctx.textAlign = 'center';
+        this.ctx.fillText('SHOP', sx, sy - sz - 4);
+        if (this.player.x === this.shopRoomCenter.x && this.player.y === this.shopRoomCenter.y && !this.shopOpen) {
+          this.ctx.fillStyle = '#e0a030';
+          this.ctx.font = '8px monospace';
+          this.ctx.fillText('[SPACE] Browse', sx, sy + sz + 10);
+        }
+        this.ctx.textAlign = 'start';
+      }
+    }
+
+    // Render healing zones
+    for (const zone of this.healingZones) {
+      const zsx = zone.x - this.camera.x;
+      const zsy = zone.y - this.camera.y;
+      const alpha = Math.min(0.25, zone.timer * 0.1);
+      const pulse = 0.5 + Math.sin(this.gameTime * 5) * 0.3;
+      this.ctx.beginPath();
+      this.ctx.arc(zsx, zsy, zone.radius, 0, Math.PI * 2);
+      this.ctx.fillStyle = `rgba(50,255,150,${alpha * pulse})`;
+      this.ctx.fill();
+      this.ctx.strokeStyle = `rgba(50,255,100,${alpha * 1.5})`;
+      this.ctx.lineWidth = 1;
+      this.ctx.stroke();
+    }
+
     for (const enemy of this.enemies) {
       const dx = enemy.x - this.player.x;
       const dy = enemy.y - this.player.y;
@@ -1103,7 +1618,7 @@ export class Game {
       for (let step = 1; step <= beam.range / TILE_SIZE; step++) {
         const tx = Math.floor((beam.x + beam.dx * step * TILE_SIZE) / TILE_SIZE);
         const ty = Math.floor((beam.y + beam.dy * step * TILE_SIZE) / TILE_SIZE);
-        if (tx < 0 || tx >= MAP_WIDTH || ty < 0 || ty >= MAP_HEIGHT || this.map[ty][tx] === TileType.Wall) {
+        if (tx < 0 || tx >= MAP_WIDTH || ty < 0 || ty >= MAP_HEIGHT || this.map[ty][tx] === TileType.Wall || this.map[ty][tx] === TileType.CrackedWall) {
           beamEndX = bsx + beam.dx * step * TILE_SIZE;
           beamEndY = bsy + beam.dy * step * TILE_SIZE;
           break;
@@ -1156,6 +1671,29 @@ export class Game {
 
     renderHud(this.ctx, this.player, this.canvasW, this.canvasH, this.selectedSlot, this.nearbyMineral, visibleEnemies, this.floor, this.comboCount, this.comboTimer, this.bossAlive, this.keys, this.activeBuffs);
 
+    // Floor transition overlay
+    if (this.transitionTimer > 0) {
+      const alpha = this.transitionTimer > 1.0 ? (1.5 - this.transitionTimer) * 2 : Math.min(1, this.transitionTimer / 0.5);
+      this.ctx.fillStyle = `rgba(0,0,0,${Math.min(0.9, alpha)})`;
+      this.ctx.fillRect(0, 0, this.canvasW, this.canvasH);
+      const textAlpha = Math.min(1, alpha * 1.5);
+      this.ctx.globalAlpha = textAlpha;
+      this.ctx.fillStyle = '#e0a030';
+      this.ctx.font = 'bold 32px monospace';
+      this.ctx.textAlign = 'center';
+      this.ctx.fillText(`FLOOR ${this.transitionFloor}`, this.canvasW / 2, this.canvasH / 2 - 10);
+      this.ctx.fillStyle = '#888';
+      this.ctx.font = '14px monospace';
+      this.ctx.fillText(this.transitionMessage, this.canvasW / 2, this.canvasH / 2 + 20);
+      this.ctx.textAlign = 'start';
+      this.ctx.globalAlpha = 1;
+    }
+
+    // Shop overlay
+    if (this.shopOpen) {
+      this.renderShopOverlay();
+    }
+
     if (this.player.dead) {
       // Save progression on death (once)
       if (!this.showUpgradeScreen) {
@@ -1167,6 +1705,20 @@ export class Game {
         this.progress.bestFloor = Math.max(this.progress.bestFloor, this.floor);
         this.progress.substratePoints += reward;
         this.progress.discoveredEvolutions = [...this.player.discoveredEvolutions];
+
+        // Save run history
+        const runRecord: RunRecord = {
+          floor: this.floor,
+          kills: this.runKills,
+          bossKills: this.runBossKills,
+          evolutions: Math.max(0, evoCount),
+          points: reward,
+          timestamp: Date.now(),
+        };
+        if (!this.progress.runHistory) this.progress.runHistory = [];
+        this.progress.runHistory.push(runRecord);
+        if (this.progress.runHistory.length > 10) this.progress.runHistory = this.progress.runHistory.slice(-10);
+
         saveProgress(this.progress);
       }
 
@@ -1193,17 +1745,26 @@ export class Game {
       this.ctx.fillStyle = '#888';
       this.ctx.fillText(`Best: Floor ${this.progress.bestFloor} | Runs: ${this.progress.totalRuns}`, cx, 121);
 
+      // Best run from history
+      if (this.progress.runHistory && this.progress.runHistory.length > 1) {
+        const best = this.progress.runHistory.reduce((a, b) => a.floor > b.floor || (a.floor === b.floor && a.kills > b.kills) ? a : b);
+        this.ctx.fillStyle = '#666';
+        this.ctx.font = '9px monospace';
+        this.ctx.fillText(`Record: Floor ${best.floor}, ${best.kills} kills, ${best.bossKills} bosses`, cx, 133);
+      }
+
       // Divider line
+      const dividerY = (this.progress.runHistory && this.progress.runHistory.length > 1) ? 143 : 135;
       this.ctx.strokeStyle = '#333';
       this.ctx.beginPath();
-      this.ctx.moveTo(cx - 200, 135);
-      this.ctx.lineTo(cx + 200, 135);
+      this.ctx.moveTo(cx - 200, dividerY);
+      this.ctx.lineTo(cx + 200, dividerY);
       this.ctx.stroke();
 
       // Two-column layout: Evolutions (left) | Upgrades (right)
       const colLeft = cx - 160;
       const colRight = cx + 60;
-      const colTop = 155;
+      const colTop = dividerY + 12;
 
       // Left column: Evolutions
       this.ctx.textAlign = 'start';
@@ -1250,6 +1811,70 @@ export class Game {
     }
   }
 
+  private renderShopOverlay(): void {
+    const panelW = 320;
+    const panelH = 40 + this.shopInventory.length * 28;
+    const panelX = this.canvasW / 2 - panelW / 2;
+    const panelY = this.canvasH / 2 - panelH / 2;
+
+    // Background
+    this.ctx.fillStyle = 'rgba(0,0,0,0.85)';
+    this.ctx.fillRect(panelX, panelY, panelW, panelH);
+    this.ctx.strokeStyle = '#e0a030';
+    this.ctx.lineWidth = 2;
+    this.ctx.strokeRect(panelX, panelY, panelW, panelH);
+
+    // Title
+    this.ctx.fillStyle = '#e0a030';
+    this.ctx.font = 'bold 14px monospace';
+    this.ctx.textAlign = 'center';
+    this.ctx.fillText('MERCHANT', this.canvasW / 2, panelY + 20);
+    this.ctx.fillStyle = '#888';
+    this.ctx.font = '9px monospace';
+    this.ctx.fillText('Pay with HP  |  [1-4] Buy  [ESC] Close', this.canvasW / 2, panelY + 34);
+
+    // Items
+    this.ctx.textAlign = 'start';
+    for (let i = 0; i < this.shopInventory.length; i++) {
+      const item = this.shopInventory[i];
+      const iy = panelY + 50 + i * 28;
+
+      if (item.purchased) {
+        this.ctx.fillStyle = '#444';
+        this.ctx.font = '10px monospace';
+        this.ctx.fillText(`[${i + 1}] SOLD`, panelX + 12, iy + 8);
+        continue;
+      }
+
+      const canAfford = this.player.hp > item.hpCost;
+      if (item.type === 'mineral' && item.mineral) {
+        const elemColor = ELEMENT_COLORS[item.mineral.element];
+        this.ctx.fillStyle = canAfford ? elemColor : '#555';
+        this.ctx.font = 'bold 10px monospace';
+        const name = `${MODIFIER_NAMES[item.mineral.modifier]} ${ELEMENT_NAMES[item.mineral.element]}`;
+        this.ctx.fillText(`[${i + 1}] ${name}`, panelX + 12, iy + 8);
+        // Rarity tag
+        const rarityNames = ['Common', 'Uncommon', 'Rare', 'Legendary'];
+        const rarityColors = ['#aaa', '#44cc44', '#4488ff', '#ff8800'];
+        this.ctx.fillStyle = canAfford ? rarityColors[item.mineral.rarity] : '#555';
+        this.ctx.font = '8px monospace';
+        this.ctx.fillText(`[${rarityNames[item.mineral.rarity]}]`, panelX + 210, iy + 8);
+      } else {
+        this.ctx.fillStyle = canAfford ? '#44ff44' : '#555';
+        this.ctx.font = 'bold 10px monospace';
+        this.ctx.fillText(`[${i + 1}] Health Potion (+${item.healAmount} HP)`, panelX + 12, iy + 8);
+      }
+
+      // Cost
+      this.ctx.fillStyle = canAfford ? '#ff6666' : '#553333';
+      this.ctx.font = '9px monospace';
+      this.ctx.textAlign = 'end';
+      this.ctx.fillText(`-${item.hpCost} HP`, panelX + panelW - 12, iy + 8);
+      this.ctx.textAlign = 'start';
+    }
+    this.ctx.textAlign = 'start';
+  }
+
   private renderMinimap(): void {
     const mmScale = 2;
     const mmW = MAP_WIDTH * mmScale;
@@ -1272,12 +1897,23 @@ export class Game {
     this.ctx.fillStyle = '#ffe060';
     this.ctx.fillRect(mmX + this.stairsX * mmScale - 1, mmY + this.stairsY * mmScale - 1, 3, 3);
 
+    const showAllEnemies = this.player.hasMercuryPassive;
     for (const e of this.enemies) {
+      if (e.dead) continue;
+      // Without Mercury passive, only show enemies within vision range
+      if (!showAllEnemies && !e.isBoss) {
+        const edx = e.x - this.player.x;
+        const edy = e.y - this.player.y;
+        if (edx * edx + edy * edy > (VISION_RADIUS + 2) ** 2) continue;
+      }
       if (e.isBoss) {
         this.ctx.fillStyle = '#ff4488';
         this.ctx.fillRect(mmX + e.x * mmScale - 1, mmY + e.y * mmScale - 1, 3, 3);
+      } else if (e.isElite) {
+        this.ctx.fillStyle = '#ffcc44';
+        this.ctx.fillRect(mmX + e.x * mmScale, mmY + e.y * mmScale, 2, 2);
       } else {
-        this.ctx.fillStyle = '#cc4444';
+        this.ctx.fillStyle = showAllEnemies ? '#ff6666' : '#cc4444';
         this.ctx.fillRect(mmX + e.x * mmScale, mmY + e.y * mmScale, 1, 1);
       }
     }

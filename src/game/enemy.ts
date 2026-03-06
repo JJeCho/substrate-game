@@ -1,5 +1,5 @@
 import { TILE_SIZE, MAP_WIDTH, MAP_HEIGHT, ELEMENT_COLORS, STATUS_TICK_INTERVAL } from './constants';
-import { TileType, StatusType } from './types';
+import { TileType, StatusType, BossType } from './types';
 import type { GameMap, MineralData, Room, Point, StatusEffect } from './types';
 import type { Camera } from './camera';
 import type { Player } from './player';
@@ -45,15 +45,25 @@ export class Enemy {
   // Status effects
   statusEffects: StatusEffect[] = [];
 
+  // Elite flag
+  isElite = false;
+
   // Boss fields
   isBoss = false;
-  bossPhase: 'idle' | 'charge' | 'slam' | 'summon' = 'idle';
+  bossType: number = BossType.IronGuardian;
+  bossPhase: 'idle' | 'charge' | 'slam' | 'summon' | 'shield' = 'idle';
   bossAttackTimer = 0;
+  bossShieldTimer = 0;
+  bossTeleportCooldown = 0;
+  bossSummonCooldown = 0;
 
   // Callbacks
   onShoot: ((p: Projectile) => void) | null = null;
   onBossSlam: (() => void) | null = null;
   onBossSummon: (() => void) | null = null;
+  onMeleeHit: ((damage: number) => void) | null = null;
+  onBossTeleport: (() => void) | null = null;
+  onPoisonTrail: (() => void) | null = null;
 
   // Movement interpolation
   private moving = false;
@@ -91,9 +101,24 @@ export class Enemy {
   static createBoss(tileX: number, tileY: number, floorDepth: number): Enemy {
     const boss = new Enemy(tileX, tileY, 'boss');
     const scale = 1 + (floorDepth - 1) * 0.2;
-    boss.hp = Math.round(200 * scale);
+
+    // Select boss type based on floor
+    const cycle = Math.floor((floorDepth - 1) / 3) % 3;
+    if (cycle === 0) boss.bossType = BossType.IronGuardian;
+    else if (cycle === 1) boss.bossType = BossType.SulfurWyrm;
+    else boss.bossType = BossType.MercuryPhantom;
+
+    const statTable: Record<number, { hp: number; dmg: number; spd: number; color: string }> = {
+      [BossType.IronGuardian]: { hp: 300, dmg: 12, spd: 2.0, color: '#4488ff' },
+      [BossType.SulfurWyrm]: { hp: 180, dmg: 18, spd: 3.0, color: '#dddd00' },
+      [BossType.MercuryPhantom]: { hp: 160, dmg: 14, spd: 3.5, color: '#cc55ff' },
+    };
+    const stats = statTable[boss.bossType] || statTable[BossType.IronGuardian];
+    boss.hp = Math.round(stats.hp * scale);
     boss.maxHp = boss.hp;
-    boss.damage = Math.round(15 * scale);
+    boss.damage = Math.round(stats.dmg * scale);
+    boss.speed = stats.spd;
+    boss.baseColor = stats.color;
     return boss;
   }
 
@@ -156,6 +181,7 @@ export class Enemy {
     switch (this.state) {
       case 'attack':
         player.takeDamage(this.damage);
+        this.onMeleeHit?.(this.damage);
         // Mutated enemies apply status effects
         if (this.mutation) {
           this.applyMutationStatus(player);
@@ -212,29 +238,125 @@ export class Enemy {
 
   private bossUpdate(dt: number, map: GameMap, player: Player): void {
     this.bossAttackTimer = Math.max(0, this.bossAttackTimer - dt);
+    this.bossShieldTimer = Math.max(0, this.bossShieldTimer - dt);
+    this.bossTeleportCooldown = Math.max(0, this.bossTeleportCooldown - dt);
+    this.bossSummonCooldown = Math.max(0, this.bossSummonCooldown - dt);
     if (this.bossAttackTimer > 0) return;
 
     const dist = Math.abs(this.x - player.x) + Math.abs(this.y - player.y);
     const hpPercent = this.hp / this.maxHp;
 
+    switch (this.bossType) {
+      case BossType.IronGuardian:
+        this.ironGuardianAI(dist, hpPercent, map, player);
+        break;
+      case BossType.SulfurWyrm:
+        this.sulfurWyrmAI(dist, hpPercent, map, player);
+        break;
+      case BossType.MercuryPhantom:
+        this.mercuryPhantomAI(dist, hpPercent, map, player);
+        break;
+      default:
+        this.ironGuardianAI(dist, hpPercent, map, player);
+    }
+  }
+
+  private ironGuardianAI(dist: number, hpPercent: number, map: GameMap, player: Player): void {
+    // Shield phase at <50% HP
+    if (hpPercent < 0.5 && this.bossShieldTimer <= 0 && Math.random() < 0.1) {
+      this.bossPhase = 'shield';
+      this.bossShieldTimer = 8; // cooldown before next shield
+      this.bossAttackTimer = 3; // shield duration
+      return;
+    }
     if (dist <= 2 && this.attackCooldown <= 0) {
-      // AoE slam
       this.bossPhase = 'slam';
       this.bossAttackTimer = 1.5;
       this.attackCooldown = 1.5;
       this.onBossSlam?.();
-    } else if (dist > 2 && hpPercent < 0.5 && Math.random() < 0.15) {
-      // Summon minions
+    } else if (dist > 2 && hpPercent < 0.5 && this.bossSummonCooldown <= 0 && Math.random() < 0.15) {
       this.bossPhase = 'summon';
       this.bossAttackTimer = 2.0;
+      this.bossSummonCooldown = 10.0;
       this.onBossSummon?.();
     } else if (dist <= this.sightRange) {
-      // Charge toward player
       this.bossPhase = 'charge';
       this.moveToward(player.x, player.y, map);
     } else {
       this.moveToward(player.x, player.y, map);
     }
+  }
+
+  private sulfurWyrmAI(dist: number, hpPercent: number, map: GameMap, player: Player): void {
+    // Leave poison trail periodically
+    if (Math.random() < 0.08) {
+      this.onPoisonTrail?.();
+    }
+    if (dist <= this.sightRange && dist > 3 && this.shootCooldown <= 0) {
+      // Shoot 3 poison projectiles in spread
+      const pdx = player.px - this.px;
+      const pdy = player.py - this.py;
+      const len = Math.sqrt(pdx * pdx + pdy * pdy) || 1;
+      const baseAngle = Math.atan2(pdy / len, pdx / len);
+      for (let s = -1; s <= 1; s++) {
+        const angle = baseAngle + s * 0.3;
+        const proj = new Projectile(this.px, this.py, Math.cos(angle), Math.sin(angle), {
+          speed: TILE_SIZE * 5,
+          damage: this.damage,
+          lifetime: 1.5,
+          color: '#88cc22',
+          fromPlayer: false,
+        });
+        this.onShoot?.(proj);
+      }
+      this.shootCooldown = 2.0;
+      this.bossAttackTimer = 0.5;
+    } else if (dist <= 2 && this.attackCooldown <= 0) {
+      this.bossPhase = 'slam';
+      this.bossAttackTimer = 1.2;
+      this.attackCooldown = 1.2;
+      this.onBossSlam?.();
+    } else if (hpPercent < 0.4 && this.bossSummonCooldown <= 0 && Math.random() < 0.1) {
+      this.bossPhase = 'summon';
+      this.bossAttackTimer = 2.0;
+      this.bossSummonCooldown = 12.0;
+      this.onBossSummon?.();
+    } else if (dist <= this.sightRange) {
+      this.bossPhase = 'charge';
+      this.moveToward(player.x, player.y, map);
+    } else {
+      this.moveToward(player.x, player.y, map);
+    }
+  }
+
+  private mercuryPhantomAI(dist: number, hpPercent: number, map: GameMap, player: Player): void {
+    // Teleport periodically
+    if (this.bossTeleportCooldown <= 0 && dist > 2 && Math.random() < 0.2) {
+      this.bossTeleportCooldown = 3.0;
+      this.bossAttackTimer = 0.5;
+      this.onBossTeleport?.();
+      return;
+    }
+    if (dist <= 2 && this.attackCooldown <= 0) {
+      this.bossPhase = 'slam';
+      this.bossAttackTimer = 1.0;
+      this.attackCooldown = 1.0;
+      this.onBossSlam?.();
+    } else if (hpPercent < 0.5 && this.bossSummonCooldown <= 0 && Math.random() < 0.12) {
+      this.bossPhase = 'summon';
+      this.bossAttackTimer = 2.0;
+      this.bossSummonCooldown = 10.0;
+      this.onBossSummon?.();
+    } else if (dist <= this.sightRange) {
+      this.bossPhase = 'charge';
+      this.moveToward(player.x, player.y, map);
+    } else {
+      this.moveToward(player.x, player.y, map);
+    }
+  }
+
+  get isDamageReduced(): boolean {
+    return this.isBoss && this.bossPhase === 'shield' && this.bossAttackTimer > 0;
   }
 
   private applyMutationStatus(player: Player): void {
@@ -374,7 +496,7 @@ export class Enemy {
 
   private canMove(x: number, y: number, map: GameMap): boolean {
     if (y < 0 || y >= MAP_HEIGHT || x < 0 || x >= MAP_WIDTH) return false;
-    return map[y][x] !== TileType.Wall;
+    return map[y][x] !== TileType.Wall && map[y][x] !== TileType.CrackedWall && map[y][x] !== TileType.LockedDoor;
   }
 
   private startMove(nx: number, ny: number): void {
@@ -387,6 +509,7 @@ export class Enemy {
   }
 
   takeDamage(amount: number): void {
+    if (this.isDamageReduced) amount = Math.round(amount * 0.3);
     this.hp -= amount;
     this.flashTimer = 0.15;
     if (this.hp <= 0) {
@@ -420,6 +543,16 @@ export class Enemy {
       ctx.arc(sx, sy, radius + 2, 0, Math.PI * 2);
       ctx.fillStyle = statusColors[se.type] || '#ffffff20';
       ctx.fill();
+    }
+
+    // Elite glow
+    if (this.isElite) {
+      const pulse = 0.5 + Math.sin(Date.now() / 300) * 0.3;
+      ctx.beginPath();
+      ctx.arc(sx, sy, radius + 4, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(255,200,50,${pulse})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
     }
 
     ctx.fillStyle = color;
@@ -470,14 +603,37 @@ export class Enemy {
     ctx.textAlign = 'start';
   }
 
+  get bossName(): string {
+    const names: Record<number, string> = {
+      [BossType.IronGuardian]: 'IRON GUARDIAN',
+      [BossType.SulfurWyrm]: 'SULFUR WYRM',
+      [BossType.MercuryPhantom]: 'MERCURY PHANTOM',
+    };
+    return names[this.bossType] || 'GUARDIAN';
+  }
+
   private renderBoss(ctx: CanvasRenderingContext2D, sx: number, sy: number): void {
     const bossRadius = TILE_SIZE * 0.7;
+    const outlineColor = this.baseColor + 'aa';
+
+    // Shield visual (Iron Guardian)
+    if (this.bossPhase === 'shield' && this.bossAttackTimer > 0) {
+      const shieldPulse = 0.4 + Math.sin(Date.now() / 150) * 0.3;
+      ctx.beginPath();
+      ctx.arc(sx, sy, bossRadius + 10, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(68,136,255,${shieldPulse})`;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
 
     // Pulsing aura
     const pulse = 0.5 + Math.sin(Date.now() / 200) * 0.3;
     ctx.beginPath();
     ctx.arc(sx, sy, bossRadius + 6, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(255,68,136,${pulse * 0.2})`;
+    const [ar, ag, ab] = this.baseColor.length === 7 ?
+      [parseInt(this.baseColor.slice(1, 3), 16), parseInt(this.baseColor.slice(3, 5), 16), parseInt(this.baseColor.slice(5, 7), 16)] :
+      [255, 68, 136];
+    ctx.fillStyle = `rgba(${ar},${ag},${ab},${pulse * 0.2})`;
     ctx.fill();
 
     // Status tint
@@ -500,7 +656,7 @@ export class Enemy {
     ctx.closePath();
     ctx.fillStyle = color;
     ctx.fill();
-    ctx.strokeStyle = '#ff88aa';
+    ctx.strokeStyle = outlineColor;
     ctx.lineWidth = 2;
     ctx.stroke();
 
@@ -511,10 +667,10 @@ export class Enemy {
     ctx.fill();
 
     // Label
-    ctx.fillStyle = '#ff88aa';
+    ctx.fillStyle = outlineColor;
     ctx.font = 'bold 8px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText('GUARDIAN', sx, sy - bossRadius - 4);
+    ctx.fillText(this.bossName, sx, sy - bossRadius - 4);
     ctx.textAlign = 'start';
   }
 }
@@ -544,6 +700,14 @@ export function spawnEnemies(rooms: Room[], map: GameMap, floorDepth: number = 1
               enemy.hp = Math.round(enemy.hp * scale);
               enemy.maxHp = enemy.hp;
               enemy.damage = Math.round(enemy.damage * scale);
+            }
+            // Elite promotion: 15% chance on floor 2+
+            if (floorDepth >= 2 && Math.random() < 0.15) {
+              enemy.isElite = true;
+              enemy.hp = Math.round(enemy.hp * 2);
+              enemy.maxHp = enemy.hp;
+              enemy.damage = Math.round(enemy.damage * 1.5);
+              enemy.speed *= 1.2;
             }
             enemies.push(enemy);
             break;

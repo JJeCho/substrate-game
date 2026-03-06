@@ -1,3 +1,12 @@
+export interface RunRecord {
+  floor: number;
+  kills: number;
+  bossKills: number;
+  evolutions: number;
+  points: number;
+  timestamp: number;
+}
+
 export interface MetaProgress {
   totalRuns: number;
   bestFloor: number;
@@ -5,6 +14,7 @@ export interface MetaProgress {
   substratePoints: number;
   upgrades: Record<string, number>;
   discoveredEvolutions: string[];
+  runHistory: RunRecord[];
 }
 
 export interface UpgradeDef {
@@ -63,6 +73,7 @@ function defaultProgress(): MetaProgress {
     substratePoints: 0,
     upgrades: {},
     discoveredEvolutions: [],
+    runHistory: [],
   };
 }
 

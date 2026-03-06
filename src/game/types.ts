@@ -7,6 +7,7 @@ export const TileType = {
   Lava: 5,
   Water: 6,
   LockedDoor: 7,
+  CrackedWall: 8,
 } as const;
 
 export type TileType = (typeof TileType)[keyof typeof TileType];
@@ -88,6 +89,7 @@ export const RoomType = {
   MineralRich: 3,
   Shrine: 4,
   Shop: 5,
+  Secret: 6,
 } as const;
 
 export type RoomType = (typeof RoomType)[keyof typeof RoomType];
@@ -120,3 +122,11 @@ export interface ActiveBuff {
   duration: number;
   magnitude: number;
 }
+
+export const BossType = {
+  IronGuardian: 0,
+  SulfurWyrm: 1,
+  MercuryPhantom: 2,
+} as const;
+
+export type BossType = (typeof BossType)[keyof typeof BossType];

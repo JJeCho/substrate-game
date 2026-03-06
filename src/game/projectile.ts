@@ -21,6 +21,7 @@ export class Projectile {
   chain: number;
   chainHitIds: Set<number>;
   leavesCloud: boolean;
+  isSplit: boolean;
   dead = false;
   fromPlayer: boolean;
 
@@ -62,6 +63,7 @@ export class Projectile {
     this.chain = opts.chain ?? 0;
     this.chainHitIds = opts.chainHitIds ?? new Set();
     this.leavesCloud = opts.leavesCloud ?? false;
+    this.isSplit = false;
     this.fromPlayer = opts.fromPlayer ?? true;
   }
 
@@ -85,7 +87,7 @@ export class Projectile {
     }
 
     const tile = map[tileY][tileX];
-    if (tile === TileType.Wall || tile === TileType.LockedDoor) {
+    if (tile === TileType.Wall || tile === TileType.LockedDoor || tile === TileType.CrackedWall) {
       this.dead = true;
     }
   }
