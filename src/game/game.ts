@@ -445,6 +445,9 @@ export class Game {
     updateFloatingText(dt);
     updateVfx(dt);
 
+    // If player died from status effects (burn/poison), stop immediately
+    if (this.player.dead) return;
+
     // Trap tile damage
     const currentTile = this.map[this.player.y]?.[this.player.x];
     if (currentTile === TileType.TrapFloor) {
@@ -476,6 +479,9 @@ export class Game {
     } else {
       this.lavaTickTimer = 0;
     }
+
+    // If player died from environmental damage (trap/lava), stop immediately
+    if (this.player.dead) return;
 
     // Locked door interaction
     if (!this.player.dead) {
@@ -852,6 +858,9 @@ export class Game {
       }
     }
 
+    // If player died from enemy melee/contact, stop immediately
+    if (this.player.dead) return;
+
     // Enemy trap damage
     for (const enemy of this.enemies) {
       if (enemy.dead) continue;
@@ -1003,6 +1012,9 @@ export class Game {
 
     this.projectiles = this.projectiles.filter(p => !p.dead);
     this.enemies = this.enemies.filter(e => !e.dead);
+
+    // If player died from projectile/boss slam, stop immediately
+    if (this.player.dead) return;
 
     this.camera.follow(
       this.player.px, this.player.py,
